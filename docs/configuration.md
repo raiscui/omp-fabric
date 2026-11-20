@@ -198,7 +198,7 @@ Unknown definitions stay visible as waiting. They do not fail the Fabric runtime
 
 `prewalk.enabled` defaults to `true` and is the persistent master switch. Turn it off under **Prewalk → Enabled** in `/fabric settings`, or run `/fabric prewalk --disable`; the command always saves to global scope, and the settings view saves to whichever scope it currently targets. Disabling also cancels any live arm. `/fabric prewalk --enable` turns it back on. `/fabric prewalk --off` only cancels the current arm for this session and does not change the saved master switch.
 
-`prewalk.model` is the optional OMP `provider/model` that `/fabric prewalk` selects. `prewalk.mode` chooses how execution continues:
+`prewalk.model` accepts an OMP `provider/model` or a session `@role` selector such as `"@code,@task"`. Role candidates are resolved in order against the active session when the handoff runs, including after re-arming. Use a comma-separated string for this field; candidate arrays are not supported. `prewalk.mode` chooses how execution continues:
 
 - `"in-place"` (default) switches Main to the executor model, queues a hidden follow-up in the same session, and restores Main's boundary model when the continuation settles.
 - `"trajectory"` forks the finalized outer Fabric call and result to a visible OMP child, then waits for it. After the child finishes, a hidden continuation asks Main to verify the work and report its findings.
@@ -216,7 +216,7 @@ Unknown definitions stay visible as waiting. They do not fail the Fabric runtime
 }
 ```
 
-`prewalk.thinking` sets the optional reasoning effort for the trajectory child executor. Its values are `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`, clamped to each model's supported levels. When you leave it unset, the executor inherits `agents.thinking`. In-place mode keeps Main's session level.
+`prewalk.thinking` sets the optional reasoning effort for the trajectory child executor. Its values are `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`, clamped to each model's supported levels. An explicit `prewalk.thinking` overrides a trajectory role's thinking level; when neither specifies a level, the executor inherits `agents.thinking`. In-place mode keeps Main's session level, including when the selected role specifies a thinking level.
 
 `prewalk.alwaysRearm` defaults to `false`. When enabled, prewalk returns to an armed, taskless state after each completed handoff (in-place return or trajectory completion). Every session then starts armed automatically, non-interactively from `prewalk.model`, and `/fabric reload` re-arms as well. `/fabric prewalk --off` cancels the armed state until the next session start or reload. Turns that settle without a handoff never disarm prewalk, regardless of this setting. The settings UI labels an unset model **Ask each time**. Non-interactive sessions must configure a model. In-place mode does not require child agents. Trajectory mode requires `agents.enabled`. It shows child spawn, progress, nested tools, metrics, and completion in Main's Fabric activity UI.
 
@@ -369,7 +369,7 @@ Native calls keep OMP's original implementation, result shape, and renderer. Fab
 
 ### Auto approval mode
 
-An `auto` policy sends each validated call and its prepared arguments to a separate OMP model before invocation. Configure **Auto model** under `/fabric settings` → **Approvals**, or set the optional canonical `provider/model` key in `fabric.json`:
+An `auto` policy sends each validated call and its prepared arguments to a separate OMP model before invocation. Configure **Auto model** under `/fabric settings` → **Approvals**, or set `approvals.model` in `fabric.json` to a canonical `provider/model` or a session role selector such as `"@judge,@smol"`:
 
 ```json
 {
@@ -383,7 +383,7 @@ An `auto` policy sends each validated call and its prepared arguments to a separ
 }
 ```
 
-Choose **Inherit** in the model picker to omit `approvals.model` and use the active OMP session model. Built-in and custom models dispatch through OMP's effective provider runtime, including providers with custom API identifiers. Older supported OMP versions fall back to their compatibility provider registry. Read access stays independently configurable, and most setups leave it at `allow`.
+Choose **Inherit** in the model picker to omit `approvals.model` and use the active OMP session model. Role candidates use the active session's OMP model rules in order; the classifier keeps its existing minimal reasoning policy regardless of the role's thinking level. Use a comma-separated string for this field: an array is not supported and is treated as an unset model, which selects the active session model. Built-in and custom models dispatch through OMP's effective provider runtime, including providers with custom API identifiers. Older supported OMP versions fall back to their compatibility provider registry. Read access stays independently configurable, and most setups leave it at `allow`.
 
 The classifier receives the exact action, bounded prepared arguments, cwd, user-message text, and assistant tool calls. Fabric excludes assistant prose and tool outputs, so model-authored reasoning and retrieved hostile content cannot directly instruct the classifier. The classifier has no executable tools and must return a structured `allow` or `escalate` verdict. An `allow` verdict applies only to that call. `escalate`, malformed output, missing authentication, timeout, cancellation, or any classifier error falls back to the explicit **Allow once** / **Allow for this session** / **Deny** prompt. Headless runs fail closed when that prompt cannot be shown. Fabric attaches classifier token usage and cost to the resulting `fabric_exec` or native tool result, and execution traces record each nested verdict as `fabric.approval.auto`.
 
@@ -405,7 +405,19 @@ Cleanup runs during active Fabric sessions and when a new top-level run manager 
 
 ## Agents
 
-`agents.runner` selects the default harness: `"omp"`, `"claude"`, or `"veda"`. `agents.model` is the optional OMP `provider/id` override. `agents.claude.model` is the optional canonical Claude runtime key. `agents.claude.binary` defaults to `claude`. You can supply an absolute path or a wrapper. `OMP_FABRIC_CLAUDE_BINARY` overrides it for the current process. `/fabric settings` enumerates Claude models from that binary in the background and stores the two runner defaults independently.
+`agents.runner` selects the default harness: `"omp"`, `"claude"`, or `"veda"`. `agents.model` is the optional OMP model override and accepts a session `@role` or comma-separated role candidates as well as a `provider/id`. `agents.claude.model` is the optional canonical Claude runtime key. `agents.claude.binary` defaults to `claude`. You can supply an absolute path or a wrapper. `OMP_FABRIC_CLAUDE_BINARY` overrides it for the current process. `/fabric settings` enumerates Claude models from that binary in the background and stores the two runner defaults independently.
+
+For the OMP runner, `agents.model` also accepts an ordered array of candidates:
+
+```json
+{
+  "agents": {
+    "model": ["@panel_deepseek", "@adversary", "@review"]
+  }
+}
+```
+
+Fabric resolves the candidates against the current session's OMP `modelRoles` in order, using the first available match. If `@panel_deepseek` cannot resolve, it tries `@adversary`, then `@review`. Arrays are supported only by the OMP runner and must contain at least one `@role`.
 
 The `veda` runner drives the [Veda CLI](https://github.com/kennyfrc/veda) as the child harness. `agents.veda.binary` defaults to `veda`. An absolute path or wrapper works, and `OMP_FABRIC_VEDA_BINARY` overrides it for the current process. `agents.veda.backend` selects which backend Veda wraps: `agy` (Antigravity CLI, the default), `codex`, `claude-code`, `droid`, `pi`, or another backend registered by the installed Veda build. The `pi` value is an external Veda backend name, not an OMP host compatibility mode. Fabric passes this value through unchanged and never hardcodes AGY. `agents.veda.model` is an optional backend-specific model or Veda alias. When you omit it, Veda selects its own backend default. `agents.veda.persona` picks the global Veda persona: `navigator-plan`, `navigator-chat` (default), `reviewer`, `worker`, or a custom persona under `~/.config/veda/personas/<name>/AGENTS.md`. Per-run selection overrides it through `agents.run({ persona })`. You can also edit the Veda backend, persona, and model in the Fabric settings panel under Agents. Each child runs one headless `veda --json` prompt with an isolated `fabric-<run-id>` session, so parallel children never share Veda selection or conversation state. Veda sessions lack persistence, and steering is unsupported. Veda children are not recursively Fabric-equipped (`recursive: true` is rejected), and they cannot back persistent actors.
 

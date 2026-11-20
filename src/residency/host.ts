@@ -11,6 +11,7 @@ import {
   type FabricModelCandidate,
 } from "../core/model-resolution.js";
 import { loadModelUsage } from "../core/model-usage.js";
+import { isOmpRoleSelector, validateNativeThinking } from "../core/model-resolution.js";
 import {
   parseFabricOwnedModelGuidance,
   resolveFabricModelGuidance,
@@ -117,7 +118,7 @@ const validateResidentHostConfig = (value: unknown, configPath: string): Residen
   return config as ResidentHostConfig;
 };
 
-class ResidentHost {
+export class ResidentHost {
   readonly hostId: string;
   readonly identity: MeshIdentity;
   readonly mesh: MeshStore;
@@ -182,7 +183,7 @@ class ResidentHost {
       readJson<Partial<ResidentHostConfig>>(guidanceConfigPath) ?? config;
     const currentModelGuidance = () =>
       parseFabricOwnedModelGuidance(currentConfig().modelGuidance ?? config.modelGuidance);
-    const resolveResidentOmpModel = (selector?: string): string => {
+    const resolveResidentOmpModel = (selector?: string, nativeThinking?: "auto" | "inherit"): string => {
       const state = currentConfig().models ?? config.models;
       const available: FabricModelCandidate[] = Array.isArray(state?.available)
         ? state.available.flatMap((candidate) =>
@@ -196,12 +197,17 @@ class ResidentHost {
           )
         : [];
       const query = selector?.trim() || state?.defaultModel?.trim() || "";
+      if (isOmpRoleSelector(query)) {
+        throw new Error("Cannot resolve an OMP role in a detached resident host without its owning session settings");
+      }
       const resolved = resolveAvailableOmpModel(query, {
         aliases: normalizeModelAliases(state?.aliases),
         available,
         lastUsed: loadModelUsage(),
       });
-      return `${resolved.provider}/${resolved.id}`;
+      const model = `${resolved.provider}/${resolved.id}`;
+      validateNativeThinking(model, nativeThinking, available);
+      return model;
     };
     this.agents = new AgentManager(config.cwd, config.agents, {
       workerPath: config.workerPath,
@@ -218,7 +224,7 @@ class ResidentHost {
       hostId: this.hostId,
       identityId: this.identity.id,
       retention: config.retention,
-      prepareOmpModel: async (model) => resolveResidentOmpModel(model),
+      prepareOmpModel: async (model, explicitThinking, nativeThinking) => resolveResidentOmpModel(model, explicitThinking ? undefined : nativeThinking),
       resolveParticipantGuidance: ({ model }) => {
         if (!model) return undefined;
         return resolveFabricModelGuidance(currentModelGuidance(), {

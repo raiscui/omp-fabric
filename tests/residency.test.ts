@@ -2,13 +2,22 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Settings, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { afterEach, describe, expect, it } from "vitest";
+import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { ActorManager } from "../src/actors/manager.js";
+import type { FabricActorMessage } from "../src/actors/types.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import type { FabricMainAgentDeliveryRequest, FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import type { FabricInvocationContext } from "../src/protocol.js";
+import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { ResidencyClient } from "../src/residency/client.js";
+import { ResidentHost } from "../src/residency/host.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import {
   RESIDENT_HOST_FORMAT,
@@ -252,6 +261,186 @@ describe("durable cwd validation", () => {
       expect(fs.existsSync(path.join(state.config.residencyRoot, "requests"))).toBe(false);
     } finally {
       await client.close();
+      await state.participants.close();
+    }
+  });
+});
+
+describe("resident OMP model preparation", () => {
+  it.each([
+    ["auto", "visible:auto"], ["auto", "VISIBLE:auto"], ["auto", "visible:AUTO"], ["auto", "VISIBLE:AUTO"],
+    ["inherit", "visible:inherit"], ["inherit", "VISIBLE:inherit"], ["inherit", "visible:INHERIT"], ["inherit", "VISIBLE:INHERIT"],
+  ] as const)("rechecks the owner snapshot for %s against literal %s", async (mode, literalId) => {
+    const state = await rootHarness("resident-native-" + mode);
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.writeFileSync(path.join(state.config.residencyRoot, "config.json"), JSON.stringify(state.config));
+    const host = new ResidentHost(state.config);
+    try {
+      const first = await host.agents.run({ task: "first", runner: "omp", transport: "process", model: "provider/visible", nativeThinking: mode });
+      expect(first.status).toBe("completed");
+      expect(first.model).toBe("provider/visible");
+      await expect(host.agents.spawn({ task: "unknown literal", runner: "omp", model: `provider/visible:${mode}` })).rejects.toThrow("not available to this OMP session");
+      const updated = structuredClone(state.config);
+      updated.models!.available.push({ provider: "provider", id: literalId });
+      fs.writeFileSync(path.join(state.config.residencyRoot, "config.json"), JSON.stringify(updated));
+      await expect(host.agents.spawn({ task: "collision", runner: "omp", model: "provider/visible", nativeThinking: mode })).rejects.toThrow(
+        `OMP role native thinking selector conflicts with a literal model ID: provider/visible:${mode}`,
+      );
+      const literal = await host.agents.run({ task: "literal", runner: "omp", transport: "process", model: `provider/visible:${mode}` });
+      expect(literal.status).toBe("completed");
+      expect(literal.model).toBe(`provider/${literalId}`);
+    } finally {
+      await host.close();
+      await state.participants.close();
+    }
+  });
+
+  it("resolves caller roles before resident ask and tell and rechecks owner visibility", { timeout: 45_000 }, async () => {
+    const state = await rootHarness("resident-role-binding");
+    fs.mkdirSync(state.config.residencyRoot, { recursive: true });
+    fs.writeFileSync(path.join(state.config.residencyRoot, "config.json"), JSON.stringify(state.config));
+    const host = new ResidentHost(state.config);
+    const control = new FabricControlPlane(state.mesh, state.identity, {
+      enabled: true,
+      hostId: state.identity.id,
+      pollMs: 20,
+      acknowledgementTimeoutMs: 3_000,
+    });
+    const callerAgents = new AgentManager(repo, state.config.agents, {
+      workerPath: fakeWorker,
+      runRoot: path.join(state.root, "caller-runs"),
+    });
+    const callerActors = new ActorManager(
+      state.config.sessionId,
+      state.identity,
+      state.mesh,
+      state.meshConfig,
+      callerAgents,
+      () => {},
+      { actorRoot: path.join(state.root, "caller-actors"), mainAgent: state.mainAgent },
+    );
+    const lifecycle = new LifecycleBroker(
+      state.mesh,
+      state.identity,
+      state.participants,
+      { enabled: true, pollMs: 20, maxReadEvents: 100 },
+      async () => {},
+    );
+    const provider = new AgentsProvider(
+      callerAgents,
+      callerActors,
+      new GlobalActorRegistry(state.root, 64 * 1_024),
+      state.mainAgent,
+      state.participants,
+      control,
+      lifecycle,
+    );
+    const settings = Settings.isolated({
+      modelRoles: { worker: "provider/visible:high", hidden: "provider/invisible:medium" },
+    });
+    settings.overrideModelRoles({ worker: "deepseek/deepseek-chat:low" });
+    const available = [
+      { provider: "provider", id: "visible", reasoning: true },
+      { provider: "deepseek", id: "deepseek-chat", reasoning: true },
+      { provider: "provider", id: "invisible", reasoning: true },
+    ] as unknown as ReturnType<ExtensionContext["modelRegistry"]["getAvailable"]>;
+    const invocation: FabricInvocationContext = {
+      cwd: repo,
+      signal: undefined,
+      parentToolCallId: "resident-role-test",
+      nestedToolCallId: "resident-role-test-nested",
+      extensionContext: {
+        cwd: repo,
+        modelRegistry: { getAvailable: () => available },
+        models: { resolve: (selector: string) => resolveModelRoleValue(selector, available, { settings }).model },
+      } as unknown as ExtensionContext,
+      update() {},
+    };
+
+    try {
+      await host.start();
+      control.start(() => ({ accepted: false }));
+      await expect(host.actors.create({
+        name: "role-bound resident",
+        instructions: "Run the caller-resolved binding.",
+        residency: "durable",
+        runner: "omp",
+        model: "@worker",
+        triggerTurn: false,
+      })).rejects.toThrow(/Cannot resolve an OMP role in a detached resident host/);
+
+      const actor = await host.actors.create({
+        name: "role-bound resident",
+        instructions: "Run the caller-resolved binding.",
+        residency: "durable",
+        runner: "omp",
+        transport: "process",
+        model: "provider/visible",
+        thinking: "high",
+        triggerTurn: false,
+      });
+      if (!actor.sessionFile) throw new Error("Resident actor has no session file");
+      const runsDir = path.join(path.dirname(actor.sessionFile), "runs");
+      await host.participants.refresh();
+      await waitFor(() => state.participants.get(actor.id)?.ownerHostId === host.hostId);
+      expect(state.participants.get(actor.id)).toMatchObject({
+        ownerHostId: host.hostId,
+        ownerIdentityId: host.identity.id,
+        runner: "omp",
+        local: false,
+      });
+
+      const reply = await withActiveSettings(settings, () => provider.invoke(
+        "ask",
+        { id: actor.id, message: "report", model: ["@missing", "@worker"] },
+        invocation,
+      )) as FabricActorMessage;
+      expect(reply).toMatchObject({ actorId: actor.id, action: "message", text: "fake worker complete" });
+      if (!reply.runId) throw new Error("Resident ask returned no run ID");
+      const askStatusPath = path.join(runsDir, reply.runId, "status.json");
+      await waitFor(() => fs.existsSync(askStatusPath));
+      expect(JSON.parse(fs.readFileSync(askStatusPath, "utf8"))).toMatchObject({
+        status: "completed",
+        model: "deepseek/deepseek-chat",
+        thinking: "low",
+      });
+
+      const queued = await withActiveSettings(settings, () => provider.invoke(
+        "tell",
+        { id: actor.id, message: "queue", model: "@worker", thinking: "minimal" },
+        invocation,
+      ));
+      expect(queued).toMatchObject({ queued: true, routed: "mesh", acknowledged: true });
+      let tellRunId: string | undefined;
+      await waitFor(() => {
+        tellRunId = host.actors.messages(actor.id).find((message) =>
+          message.direction === "out" && message.text === "fake worker complete" &&
+          message.runId !== undefined && message.runId !== reply.runId,
+        )?.runId;
+        return tellRunId !== undefined && fs.existsSync(path.join(runsDir, tellRunId, "status.json"));
+      });
+      if (!tellRunId) throw new Error("Resident tell returned no run ID");
+      expect(JSON.parse(fs.readFileSync(path.join(runsDir, tellRunId, "status.json"), "utf8"))).toMatchObject({
+        status: "completed",
+        model: "deepseek/deepseek-chat",
+        thinking: "minimal",
+      });
+      expect(host.actors.status(actor.id).projectDefaults).toMatchObject({
+        model: "provider/visible",
+        thinking: "high",
+      });
+
+      await expect(withActiveSettings(settings, () => provider.invoke(
+        "tell",
+        { id: actor.id, message: "do not run", model: "@hidden" },
+        invocation,
+      ))).rejects.toThrow('Model "provider/invisible" is not available to this OMP session.');
+    } finally {
+      await control.close();
+      await lifecycle.close();
+      await callerActors.close();
+      await callerAgents.close();
+      await host.close();
       await state.participants.close();
     }
   });

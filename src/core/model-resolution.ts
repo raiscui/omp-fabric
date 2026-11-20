@@ -1,5 +1,17 @@
 const PROVIDER_MODEL_RE = /^[^\s/]+\/[^\s/]+$/;
 
+export const isOmpRoleSelector = (value: string): boolean =>
+  value.split(",").some((part) => part.trim().startsWith("@"));
+
+export const validateNativeThinking = (model: string, nativeThinking: "auto" | "inherit" | undefined, available: readonly FabricModelCandidate[]): void => {
+  if (!nativeThinking) return;
+  const selector = `${model}:${nativeThinking}`;
+  const normalized = selector.toLowerCase();
+  if (available.some((candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalized)) {
+    throw new Error(`OMP role native thinking selector conflicts with a literal model ID: ${selector}`);
+  }
+};
+
 /** Minimal model view needed for resolution; satisfied by OMP Model entries. */
 export interface FabricModelCandidate {
   provider: string;

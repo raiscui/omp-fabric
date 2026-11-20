@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { isOmpRoleSelector } from "../core/model-resolution.js";
 import type { FabricState } from "../fabric-state.js";
 import {
   PREWALK_ARMED_MESSAGE_TYPE,
@@ -74,8 +75,8 @@ export const autoArmFabricPrewalk = async (
     return "Fabric prewalk auto-arm skipped: trajectory mode requires agents.enabled.";
   }
   const model = prewalk.model?.trim();
-  if (!model || !model.includes("/")) {
-    return "Fabric prewalk auto-arm skipped: set prewalk.model (provider/model) in /fabric settings so sessions arm without the interactive picker.";
+  if (!model || (!model.includes("/") && !isOmpRoleSelector(model))) {
+    return "Fabric prewalk auto-arm skipped: set prewalk.model (provider/model or @role) in /fabric settings so sessions arm without the interactive picker.";
   }
   await armFabricPrewalkSession(state, context, omp, { model });
   return undefined;

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { isOmpRoleSelector } from "../core/model-resolution.js";
 import { ompChildToolName } from "../core/omp-tools.js";
 import {
   DEFAULT_FABRIC_CONFIG,
@@ -186,6 +187,7 @@ interface ManagedAgent {
   abortSignal: AbortSignal | undefined;
   abortHandler: (() => void) | undefined;
   model?: string;
+  nativeThinking?: "auto" | "inherit";
   thinking?: AgentRunRequest["thinking"];
   actorId?: string;
   actorName?: string;
@@ -408,10 +410,10 @@ export class AgentManager {
   readonly #onBackgroundComplete: ((result: AgentRunResult) => void) | undefined;
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
   readonly #prepareOmpModel:
-    | ((model: string | undefined) => Promise<string | void>)
+    | ((model: string | undefined, explicitThinking?: boolean, nativeThinking?: "auto" | "inherit") => Promise<string | { model: string; thinking?: import("../thinking.js").FabricThinking; nativeThinking?: "auto" | "inherit" } | void>)
     | undefined;
   readonly #resolveParticipantGuidance: AgentParticipantGuidanceResolver | undefined;
-  readonly #ompModelPreparations = new Map<string, Promise<string | undefined>>();
+  readonly #ompModelPreparations = new Map<string, Promise<{ model?: string; thinking?: import("../thinking.js").FabricThinking; nativeThinking?: "auto" | "inherit" }>>();
   readonly #budget: BudgetLedgerState | undefined;
   readonly #budgetOwned: boolean;
   readonly #uiListeners = new Set<() => void>();
@@ -445,7 +447,7 @@ export class AgentManager {
       retention?: FabricRetentionConfig;
       onBackgroundComplete?: (result: AgentRunResult) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
-      prepareOmpModel?: (model: string | undefined) => Promise<string | void>;
+      prepareOmpModel?: (model: string | undefined, explicitThinking?: boolean, nativeThinking?: "auto" | "inherit") => Promise<string | { model: string; thinking?: import("../thinking.js").FabricThinking; nativeThinking?: "auto" | "inherit" } | void>;
       resolveParticipantGuidance?: AgentParticipantGuidanceResolver;
       judgment?: FabricJudgmentLane;
       judgmentGates?: () => FabricJudgmentGatesConfig;
@@ -510,14 +512,21 @@ export class AgentManager {
     }
   }
 
-  async #prepareModel(model: string | undefined): Promise<string | undefined> {
-    if (!this.#prepareOmpModel) return model;
-    const key = model?.trim() || "<session-default>";
+  async #prepareModel(model: string | undefined, explicitThinking = false, nativeThinking?: "auto" | "inherit"): Promise<{ model?: string; thinking?: import("../thinking.js").FabricThinking; nativeThinking?: "auto" | "inherit" }> {
+    if (!this.#prepareOmpModel) return model ? { model } : {};
+    if (nativeThinking || (model && isOmpRoleSelector(model))) {
+      const prepared = await this.#prepareOmpModel(model, explicitThinking, nativeThinking);
+      if (typeof prepared === "object" && prepared !== null) return prepared;
+      const resolved = typeof prepared === "string" ? prepared.trim() : model;
+      return resolved ? { model: resolved } : {};
+    }
+    const key = `${model?.trim() || "<session-default>"}:${explicitThinking}`;
     const existing = this.#ompModelPreparations.get(key);
     if (existing) return existing;
-    const preparation = this.#prepareOmpModel(model).then((prepared) => {
-      if (typeof prepared !== "string") return model;
-      return prepared.trim() || model;
+    const preparation = (explicitThinking ? this.#prepareOmpModel(model, true) : this.#prepareOmpModel(model)).then((prepared) => {
+      if (typeof prepared === "object" && prepared !== null) return prepared;
+      const key = typeof prepared === "string" ? prepared.trim() : model;
+      return key ? { model: key } : {};
     });
     this.#ompModelPreparations.set(key, preparation);
     try {
@@ -606,8 +615,15 @@ export class AgentManager {
       if (runner === "veda" && model) normalizeVedaModel(model);
     }
     const release = await this.#semaphore.acquire(signal);
+    let roleThinking: import("../thinking.js").FabricThinking | undefined;
+    let nativeThinking: "auto" | "inherit" | undefined = request.nativeThinking;
     try {
-      if (runner === "omp") model = await this.#prepareModel(model);
+      if (runner === "omp") {
+        const prepared = await this.#prepareModel(model, request.thinking !== undefined, request.nativeThinking);
+        model = prepared.model;
+        roleThinking = prepared.thinking;
+        nativeThinking = request.nativeThinking ?? prepared.nativeThinking;
+      }
     } catch (error) {
       release();
       throw error;
@@ -668,7 +684,7 @@ export class AgentManager {
         this.config.timeoutMs,
         request.timeoutMs,
       );
-      const thinking = request.thinking ?? judged?.thinking ?? this.config.thinking;
+      const thinking = request.thinking ?? (nativeThinking ? undefined : roleThinking ?? judged?.thinking ?? this.config.thinking);
       const recursive = runner === "omp" && request.recursive === true;
       const extensions = recursive ? true : (request.extensions ?? this.config.extensions);
       // In a full-code parent every extension-enabled OMP child runs Fabric
@@ -738,7 +754,7 @@ export class AgentManager {
         ...(recursive || inheritedFullCodeMode
           ? ["--fabric-extension", this.#fabricExtensionPath]
           : []),
-        ...(model ? ["--model", model] : []),
+        ...(model ? ["--model", nativeThinking && !request.thinking ? `${model}:${nativeThinking}` : model] : []),
         ...(thinking ? ["--thinking", thinking] : []),
         ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
         ...(sessionFile ? ["--session-file", sessionFile] : []),
@@ -810,6 +826,7 @@ export class AgentManager {
         abortSignal: signal,
         abortHandler: undefined,
         ...(model ? { model } : {}),
+        ...(nativeThinking && !thinking ? { nativeThinking } : {}),
         ...(thinking ? { thinking } : {}),
         ...(request.actorId ? { actorId: request.actorId } : {}),
         ...(request.actorName ? { actorName: request.actorName } : {}),
@@ -1124,7 +1141,7 @@ export class AgentManager {
     managed: ManagedAgent,
     record: AgentRunRecord,
     deadline: number,
-  ): Promise<boolean> {
+  ): Promise<boolean | AgentRunRecord> {
     if (
       managed.startupAttempts >= AGENT_STARTUP_MAX_ATTEMPTS ||
       managed.settled ||
@@ -1151,13 +1168,17 @@ export class AgentManager {
     await delay(retryDelayMs);
     if (managed.settled || this.#closing || managed.abortSignal?.aborted) return false;
     managed.startupAttempts++;
+    let preparingNativeModel = false;
     try {
       if (managed.runner === "omp") {
-        const model = await this.#prepareModel(managed.model);
+        preparingNativeModel = managed.nativeThinking !== undefined;
+        const { model } = await this.#prepareModel(managed.model, managed.thinking !== undefined, managed.nativeThinking);
+        preparingNativeModel = false;
         const modelIndex = managed.launch.workerArguments.indexOf("--model");
         if (model) {
-          if (modelIndex >= 0) managed.launch.workerArguments[modelIndex + 1] = model;
-          else managed.launch.workerArguments.push("--model", model);
+          const launchModel = managed.nativeThinking ? `${model}:${managed.nativeThinking}` : model;
+          if (modelIndex >= 0) managed.launch.workerArguments[modelIndex + 1] = launchModel;
+          else managed.launch.workerArguments.push("--model", launchModel);
           managed.model = model;
         } else if (modelIndex >= 0) {
           managed.launch.workerArguments.splice(modelIndex, 2);
@@ -1182,7 +1203,7 @@ export class AgentManager {
       };
       writeRecord(managed.statusFile, failed);
       managed.latestRecord = failed;
-      return false;
+      return preparingNativeModel ? failed : false;
     }
   }
 
@@ -1210,8 +1231,9 @@ export class AgentManager {
         managed.runnerSessionId = record.runnerSessionId;
       }
       if (record && terminalStatuses.has(record.status)) {
-        if (await this.#retryStartup(managed, record, deadline)) continue;
-        this.#settle(managed, this.#withTransportMetadata(record, managed) as AgentRunResult);
+        const retry = await this.#retryStartup(managed, record, deadline);
+        if (retry === true) continue;
+        this.#settle(managed, this.#withTransportMetadata(retry || record, managed) as AgentRunResult);
         return;
       }
       if (Date.now() >= deadline) {
@@ -1274,12 +1296,14 @@ export class AgentManager {
                 ? `${TRANSPORT_EXITED_WITHOUT_RESULT_PREFIX}; ${detail}`
                 : TRANSPORT_EXITED_WITHOUT_RESULT_PREFIX,
             );
-            if (await this.#retryStartup(managed, failed, deadline)) {
+            const retry = await this.#retryStartup(managed, failed, deadline);
+            if (retry === true) {
               managed.lastRetriedTransportFailure = failed;
               continue;
             }
-            writeRecord(managed.statusFile, failed);
-            this.#settle(managed, failed);
+            const settled = retry || failed;
+            writeRecord(managed.statusFile, settled);
+            this.#settle(managed, settled as AgentRunResult);
             return;
           }
         } else {

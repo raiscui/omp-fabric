@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { SessionManager, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { SessionManager, Settings, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import type { FabricActorInfo, FabricActorRequest } from "../src/actors/types.js";
@@ -78,12 +80,16 @@ const setup = (
   options?: {
     switchModel?: FabricMainAgentTarget["switchModel"];
     modelsConfig?: FabricModelsConfig;
+    runner?: "omp" | "claude" | "veda";
   },
 ) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-fabric-agents-provider-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-  const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+  const agents = new AgentManager(
+    process.cwd(),
+    { ...DEFAULT_FABRIC_CONFIG.agents, ...(options?.runner ? { runner: options.runner } : {}) },
+    {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
     vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
@@ -2131,6 +2137,49 @@ describe("AgentsProvider switchModel", async () => {
     } as unknown as ExtensionContext,
   });
 
+  it("dispatches a role with its effort and honors an explicit override", async () => {
+    const { provider, agents } = setup();
+    const spawn = vi.spyOn(agents, "spawn");
+    const settings = Settings.isolated({ modelRoles: { worker: "google/gemini-2.5-flash:high" } });
+    const available = registryModels as unknown as ReturnType<ExtensionContext["modelRegistry"]["getAvailable"]>;
+    const invocation = {
+      ...modelContext(),
+      extensionContext: {
+        cwd: process.cwd(),
+        modelRegistry: { getAvailable: () => available },
+        models: { resolve: (selector: string) => resolveModelRoleValue(selector, available, { settings }).model },
+      } as unknown as ExtensionContext,
+    };
+    await withActiveSettings(settings, () => provider.invoke("run", { task: "role run", model: "@worker" }, invocation));
+    expect(spawn).toHaveBeenLastCalledWith(expect.objectContaining({ model: "google/gemini-2.5-flash", thinking: "high" }), undefined);
+    await withActiveSettings(settings, () => provider.invoke("run", { task: "role override", model: "@worker", thinking: "low" }, invocation));
+    expect(spawn).toHaveBeenLastCalledWith(expect.objectContaining({ model: "google/gemini-2.5-flash", thinking: "low" }), undefined);
+    const actor = await withActiveSettings(settings, () => provider.invoke("create", { name: "role actor", instructions: "work", model: "google/gemini-2.5-pro" }, invocation)) as FabricActorInfo;
+    const updated = await withActiveSettings(settings, () => provider.invoke("setModel", { id: actor.id, model: "@worker" }, invocation));
+    expect(updated).toMatchObject({ binding: { model: "google/gemini-2.5-flash", thinking: "high" } });
+    await withActiveSettings(settings, () => provider.invoke("run", { task: "array fallback", model: ["@missing", "@worker"] }, invocation));
+    expect(spawn).toHaveBeenLastCalledWith(expect.objectContaining({ model: "google/gemini-2.5-flash", thinking: "high" }), undefined);
+  });
+
+  it("applies a role's effort even when its model is already active", async () => {
+    const switchModel = vi.fn(async () => ({ ok: true }));
+    const { provider } = setup([], [], undefined, { switchModel: switchModel as FabricMainAgentTarget["switchModel"] });
+    const settings = Settings.isolated({ modelRoles: { worker: "google/gemini-2.5-flash:low" } });
+    const available = registryModels as unknown as ReturnType<ExtensionContext["modelRegistry"]["getAvailable"]>;
+    const invocation = {
+      ...modelContext(),
+      extensionContext: {
+        cwd: process.cwd(),
+        model: registryModels[1],
+        modelRegistry: { getAvailable: () => available },
+        models: { resolve: (selector: string) => resolveModelRoleValue(selector, available, { settings }).model },
+      } as unknown as ExtensionContext,
+    };
+    const result = await withActiveSettings(settings, () => provider.invoke("switchModel", { model: "@worker" }, invocation));
+    expect(result).toEqual({ switched: true, model: "google/gemini-2.5-flash", thinking: "low" });
+    expect(switchModel).toHaveBeenCalledWith({ provider: "google", id: "gemini-2.5-flash", thinking: "low" }, invocation.extensionContext);
+  });
+
   it("describes the action with a required model selector", async () => {
     const { provider } = setup();
     const descriptor = await provider.describe("switchModel", context);
@@ -2399,3 +2448,347 @@ describe("AgentsProvider switchModel", async () => {
   });
 });
 
+describe("AgentsProvider actor-target role candidates", async () => {
+  const registryModels = [
+    { provider: "anthropic", id: "claude-opus-4-5", name: "Claude Opus 4.5" },
+    { provider: "google", id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
+    { provider: "google", id: "gemini-2.5-pro", name: "Gemini 2.5 Pro" },
+  ];
+
+  const roleInvocation = (settings: Settings): FabricInvocationContext => {
+    const available = registryModels as unknown as ReturnType<ExtensionContext["modelRegistry"]["getAvailable"]>;
+    return {
+      ...context,
+      extensionContext: {
+        cwd: process.cwd(),
+        modelRegistry: { getAvailable: () => available },
+        models: { resolve: (selector: string) => resolveModelRoleValue(selector, available, { settings }).model },
+      } as unknown as ExtensionContext,
+    };
+  };
+
+  const remoteActorParticipant = (
+    actor: { id: string; name: string; createdAt: number; updatedAt: number },
+    runner: "omp" | "claude" | "veda",
+  ): FabricParticipantInfo => ({
+    format: 1,
+    id: actor.id,
+    kind: "actor",
+    rootId: "session:owner",
+    ownerHostId: "host:owner",
+    ownerIdentityId: "identity:owner",
+    parentId: "session:owner",
+    name: actor.name,
+    status: "idle",
+    runner,
+    transport: "host",
+    capabilities: ["steer", "followUp", "stop", "ask", "actor-bindings", "fabric"],
+    startedAt: actor.createdAt,
+    updatedAt: actor.updatedAt,
+    controlProtocol: "v1",
+    local: false,
+    stale: false,
+  });
+
+  it("accepts @role arrays for an OMP actor when the default runner is Claude", async () => {
+    const { provider, actors } = setup([], [], undefined, { runner: "claude" });
+    const settings = Settings.isolated({ modelRoles: { worker: "google/gemini-2.5-flash:high" } });
+    const invocation = roleInvocation(settings);
+    const actor = (await provider.invoke(
+      "create",
+      { name: "omp actor", instructions: "work", runner: "omp", model: "google/gemini-2.5-pro", triggerTurn: false },
+      invocation,
+    )) as FabricActorInfo;
+
+    // prepareArguments would previously reject here against the Claude default
+    // before the OMP actor target was ever resolved.
+    await withActiveSettings(settings, () =>
+      provider.invoke(
+        "tell",
+        { id: actor.id, message: "queue", model: ["@missing", "@worker"] },
+        invocation,
+      ),
+    );
+    const bound = actors.status(actor.id);
+    expect(bound.id).toBe(actor.id);
+
+    const updated = (await withActiveSettings(settings, () =>
+      provider.invoke(
+        "setModel",
+        { id: actor.id, model: ["@missing", "@worker"] },
+        invocation,
+      ),
+    )) as FabricActorInfo;
+    expect(updated).toMatchObject({ binding: { model: "google/gemini-2.5-flash", thinking: "high" } });
+
+    const response = (await withActiveSettings(settings, () =>
+      provider.invoke(
+        "ask",
+        { id: actor.id, message: "review", model: ["@missing", "@worker"] },
+        invocation,
+      ),
+    )) as { text?: string };
+    expect(response).toBeTruthy();
+    await waitFor(() => actors.status(actor.id).status === "idle");
+  });
+
+  it("rejects @role arrays for a Claude actor when the default runner is OMP", async () => {
+    const { provider } = setup();
+    const settings = Settings.isolated({ modelRoles: { worker: "google/gemini-2.5-flash:high" } });
+    const invocation = roleInvocation(settings);
+    const actor = (await provider.invoke(
+      "create",
+      { name: "claude actor", instructions: "work", runner: "claude", triggerTurn: false },
+      invocation,
+    )) as FabricActorInfo;
+    expect(actor.runner).toBe("claude");
+
+    await expect(
+      provider.invoke("ask", { id: actor.id, message: "review", model: ["@worker"] }, invocation),
+    ).rejects.toThrow(/Model candidate arrays require the OMP runner/);
+    await expect(
+      provider.invoke("tell", { id: actor.id, message: "queue", model: ["@worker"] }, invocation),
+    ).rejects.toThrow(/Model candidate arrays require the OMP runner/);
+    await expect(
+      provider.invoke("setModel", { id: actor.id, model: ["@worker"] }, invocation),
+    ).rejects.toThrow(/Model candidate arrays require the OMP runner/);
+  });
+
+  it("validates @role arrays against a remote participant's runner", async () => {
+    const settings = Settings.isolated({ modelRoles: { worker: "google/gemini-2.5-flash:high" } });
+    const invocation = roleInvocation(settings);
+
+    // Default Claude host, remote OMP actor: the array must survive prepare
+    // and be resolved against the participant's OMP runner before dispatch.
+    const response = {
+      id: "remote-response",
+      actorId: "pending",
+      actorName: "reviewer",
+      direction: "out" as const,
+      source: "direct",
+      createdAt: Date.now(),
+      text: "remote answer",
+    };
+    const requestResult = vi.fn().mockResolvedValue(response);
+    const request = vi.fn().mockResolvedValue({
+      queued: true,
+      messageId: "remote-message",
+      routed: "mesh",
+      acknowledged: true,
+    });
+    const control = { requestResult, request } as unknown as FabricControlPlane;
+    const members: FabricParticipantInfo[] = [];
+    const claudeDefault = setup([], members, control, { runner: "claude" });
+    const ompActor = await claudeDefault.actors.create({
+      ...createRequest,
+      runner: "omp",
+      model: "google/gemini-2.5-pro",
+    } as FabricActorRequest);
+    response.actorId = ompActor.id;
+    await claudeDefault.actors.cede(ompActor.id);
+    members.push(remoteActorParticipant(ompActor, "omp"));
+
+    await expect(
+      withActiveSettings(settings, () =>
+        claudeDefault.provider.invoke(
+          "ask",
+          { id: ompActor.id, message: "review", model: ["@missing", "@worker"] },
+          invocation,
+        ),
+      ),
+    ).resolves.toEqual(response);
+    // The detached owner has no session settings, so a raw role selector can
+    // never reach it: the caller resolves "@missing,@worker" through its own
+    // active role map and ships the canonical model plus the role's thinking.
+    expect(requestResult).toHaveBeenCalledWith(
+      "host:owner",
+      ompActor.id,
+      "ask",
+      expect.objectContaining({
+        message: "review",
+        binding: { model: "google/gemini-2.5-flash", thinking: "high" },
+      }),
+      "identity:owner",
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
+
+    // Default OMP host, remote Claude actor: the array must be rejected at the
+    // resolved target instead of leaking as a comma-joined string.
+    const requestResult2 = vi.fn();
+    const control2 = { requestResult: requestResult2, request: vi.fn() } as unknown as FabricControlPlane;
+    const members2: FabricParticipantInfo[] = [];
+    const ompDefault = setup([], members2, control2);
+    const claudeActor = await ompDefault.actors.create({
+      ...createRequest,
+      name: "remote claude",
+      runner: "claude",
+    } as FabricActorRequest);
+    await ompDefault.actors.cede(claudeActor.id);
+    members2.push(remoteActorParticipant(claudeActor, "claude"));
+
+    await expect(
+      ompDefault.provider.invoke(
+        "ask",
+        { id: claudeActor.id, message: "review", model: ["@worker"] },
+        invocation,
+      ),
+    ).rejects.toThrow(/Model candidate arrays require the OMP runner/);
+    expect(requestResult2).not.toHaveBeenCalled();
+  });
+
+  it("resolves remote OMP role bindings against the caller's active settings", async () => {
+    const response = {
+      id: "remote-response",
+      actorId: "pending",
+      actorName: "reviewer",
+      direction: "out" as const,
+      source: "direct",
+      createdAt: Date.now(),
+      text: "remote answer",
+    };
+    const requestResult = vi.fn().mockResolvedValue(response);
+    const request = vi.fn().mockResolvedValue({
+      queued: true,
+      messageId: "remote-message",
+      routed: "mesh",
+      acknowledged: true,
+    });
+    const control = { requestResult, request } as unknown as FabricControlPlane;
+    const members: FabricParticipantInfo[] = [];
+    const { provider, actors } = setup([], members, control);
+    const actor = await actors.create({
+      ...createRequest,
+      runner: "omp",
+      model: "google/gemini-2.5-pro",
+    } as FabricActorRequest);
+    response.actorId = actor.id;
+    await actors.cede(actor.id);
+    members.push(remoteActorParticipant(actor, "omp"));
+
+    // Two caller sessions share this owner but keep different role maps; each
+    // remote dispatch must carry that caller's own canonical model + thinking.
+    const sessionA = Settings.isolated({ modelRoles: { worker: "google/gemini-2.5-flash:high" } });
+    const sessionB = Settings.isolated({ modelRoles: { worker: "google/gemini-2.5-pro:low" } });
+    const invocationA = roleInvocation(sessionA);
+    const invocationB = roleInvocation(sessionB);
+
+    await withActiveSettings(sessionA, () =>
+      provider.invoke("ask", { id: actor.id, message: "review A", model: "@worker" }, invocationA));
+    expect(requestResult).toHaveBeenLastCalledWith(
+      "host:owner",
+      actor.id,
+      "ask",
+      expect.objectContaining({
+        message: "review A",
+        binding: { model: "google/gemini-2.5-flash", thinking: "high" },
+      }),
+      "identity:owner",
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
+
+    await withActiveSettings(sessionB, () =>
+      provider.invoke("ask", { id: actor.id, message: "review B", model: "@worker" }, invocationB));
+    expect(requestResult).toHaveBeenLastCalledWith(
+      "host:owner",
+      actor.id,
+      "ask",
+      expect.objectContaining({
+        message: "review B",
+        binding: { model: "google/gemini-2.5-pro", thinking: "low" },
+      }),
+      "identity:owner",
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
+
+    // tell takes the same caller-side role resolution before remote dispatch.
+    await withActiveSettings(sessionA, () =>
+      provider.invoke("tell", { id: actor.id, message: "queue A", model: "@worker" }, invocationA));
+    expect(request).toHaveBeenLastCalledWith(
+      "host:owner",
+      actor.id,
+      "followUp",
+      expect.objectContaining({
+        message: "queue A",
+        binding: { model: "google/gemini-2.5-flash", thinking: "high" },
+      }),
+      "identity:owner",
+    );
+
+    // An explicit thinking override wins over the role's configured level.
+    await withActiveSettings(sessionA, () =>
+      provider.invoke(
+        "ask",
+        { id: actor.id, message: "review override", model: "@worker", thinking: "minimal" },
+        invocationA,
+      ));
+    expect(requestResult).toHaveBeenLastCalledWith(
+      "host:owner",
+      actor.id,
+      "ask",
+      expect.objectContaining({
+        message: "review override",
+        binding: { model: "google/gemini-2.5-flash", thinking: "minimal" },
+      }),
+      "identity:owner",
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
+
+    for (const nativeThinking of ["auto", "inherit"] as const) {
+      const settings = Settings.isolated({ modelRoles: { worker: `google/gemini-2.5-flash:${nativeThinking}` } });
+      await withActiveSettings(settings, () =>
+        provider.invoke("ask", { id: actor.id, message: "native thinking", model: "@worker" }, roleInvocation(settings)));
+      expect(requestResult).toHaveBeenLastCalledWith(
+        "host:owner",
+        actor.id,
+        "ask",
+        expect.objectContaining({ binding: { model: "google/gemini-2.5-flash", nativeThinking } }),
+        "identity:owner",
+        expect.objectContaining({ timeoutMs: expect.any(Number) }),
+      );
+    }
+
+    // Non-role selectors keep the existing scalar remote semantics: forwarded
+    // verbatim with no caller-side resolution and no injected thinking.
+    await provider.invoke(
+      "ask",
+      { id: actor.id, message: "plain", model: "provider/one-off", thinking: "xhigh" },
+      context,
+    );
+    expect(requestResult).toHaveBeenLastCalledWith(
+      "host:owner",
+      actor.id,
+      "ask",
+      expect.objectContaining({
+        message: "plain",
+        binding: { model: "provider/one-off", thinking: "xhigh" },
+      }),
+      "identity:owner",
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
+    await provider.invoke("tell", { id: actor.id, message: "plain queue", model: "provider/one-off" }, context);
+    expect(request).toHaveBeenLastCalledWith(
+      "host:owner",
+      actor.id,
+      "followUp",
+      expect.objectContaining({
+        message: "plain queue",
+        binding: { model: "provider/one-off" },
+      }),
+      "identity:owner",
+    );
+
+    // A role the caller cannot resolve never reaches the owner as a raw "@"
+    // selector; the caller's own session error stops the dispatch.
+    const missingRole = Settings.isolated({ modelRoles: { other: "google/gemini-2.5-flash" } });
+    await expect(
+      withActiveSettings(missingRole, () =>
+        provider.invoke("ask", { id: actor.id, message: "nope", model: "@worker" }, roleInvocation(missingRole))),
+    ).rejects.toThrow(/did not resolve against this session's model roles/);
+    const calls = requestResult.mock.calls;
+    expect(
+      calls.every(([, , , input]) =>
+        typeof (input as { binding?: { model?: string } }).binding?.model !== "string" ||
+        !(input as { binding: { model: string } }).binding.model.includes("@")),
+    ).toBe(true);
+  });
+});

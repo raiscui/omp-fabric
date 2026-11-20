@@ -53,13 +53,14 @@ interface FabricImageContent {
   data: string;
   mimeType: string;
 }
+type FabricModelSelector = string | string[];
 interface FabricAgentRequest {
   task: string;
   images?: FabricImageContent[];
   name?: string;
   runner?: FabricAgentRunner;
   transport?: FabricTransport;
-  model?: string;
+  model?: FabricModelSelector;
   persona?: string;
   thinking?: FabricThinking;
   tools?: string[];
@@ -85,7 +86,7 @@ interface FabricHandoffFacts {
 }
 type FabricHandoffPredicate = (facts: Readonly<FabricHandoffFacts>) => boolean;
 interface FabricHandoffRequest {
-  model: string;
+  model: FabricModelSelector;
   task?: string;
   when?: FabricHandoffPredicate;
   name?: string;
@@ -561,7 +562,7 @@ interface FabricActorValidityFacts {
 }
 type FabricActorValidityDecision = boolean | { valid: boolean; reason?: string };
 type FabricActorBindingScope = "session" | "project";
-interface FabricActorRunBinding { model?: string; thinking?: FabricThinking }
+interface FabricActorRunBinding { model?: string; nativeThinking?: "auto" | "inherit"; thinking?: FabricThinking }
 type FabricActorValidWhile = (facts: Readonly<FabricActorValidityFacts>) => FabricActorValidityDecision;
 interface FabricActorRequestBase {
   scope?: "session" | "project" | "global";
@@ -572,7 +573,7 @@ interface FabricActorRequestBase {
   responseMode?: "text" | "directive";
   coalesce?: boolean;
   runner?: FabricAgentRunner;
-  model?: string;
+  model?: FabricModelSelector;
   thinking?: FabricThinking;
   tools?: string[];
   transport?: FabricTransport;
@@ -623,8 +624,8 @@ interface FabricActorInfo {
   logDir?: string;
 }
 interface FabricModelSwitchRequest {
-  /** provider/id, a models.aliases name, or a search term; resolution tries aliases first, then exact matches, then the closest fuzzy match (recency from pi-model-sort breaks ties) against authenticated models. */
-  model: string;
+  /** OMP role candidates, provider/id, a models.aliases name, or a search term. */
+  model: FabricModelSelector;
   /** Optional provider filter applied before matching (e.g. "anthropic"). */
   provider?: string;
 }
@@ -632,6 +633,8 @@ interface FabricModelSwitchResult {
   switched: boolean;
   /** Active model as provider/id after the call (unchanged when reason is "already-active"). */
   model: string;
+  /** Thinking level applied by a resolved role selector ("inherit" when the role keeps the caller's thinking). */
+  thinking?: FabricThinking | "inherit";
   name?: string;
   /** Previously active provider/id when known. Absent for already-active results. */
   previous?: string;
@@ -684,7 +687,7 @@ interface FabricAgentsApi {
   stop(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricActorInfo | FabricRemoteControlResult>;
   cleanup(args: FabricAgentTargetArgs & { deleteBranch?: boolean; delete_branch?: boolean }): Promise<{ cleaned: boolean }>;
   create(args: FabricActorRequest): Promise<FabricActorInfo>;
-  setModel(args: { id: string; model?: string; scope?: FabricActorBindingScope }): Promise<FabricActorInfo>;
+  setModel(args: { id: string; model?: FabricModelSelector; scope?: FabricActorBindingScope }): Promise<FabricActorInfo>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
   setThinking(args: { id: string; thinking?: FabricThinking; scope?: FabricActorBindingScope }): Promise<FabricActorInfo>;
   setTools(args: { id: string; tools: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
@@ -700,8 +703,8 @@ interface FabricAgentsApi {
     instructions: string;
     scope?: "project" | "global";
   }): Promise<FabricActorInfo>;
-  ask(args: { id: string; message: string; data?: unknown; model?: string; thinking?: FabricThinking }): Promise<FabricActorMessage>;
-  tell(args: { id: string; message: string; data?: unknown; model?: string; thinking?: FabricThinking }): Promise<{ queued: true; messageId: string }>;
+  ask(args: { id: string; message: string; data?: unknown; model?: FabricModelSelector; thinking?: FabricThinking }): Promise<FabricActorMessage>;
+  tell(args: { id: string; message: string; data?: unknown; model?: FabricModelSelector; thinking?: FabricThinking }): Promise<{ queued: true; messageId: string }>;
   steer(args: { id: string; message: string; data?: unknown }): Promise<{ queued: true; messageId: string; routed?: "local" | "main" | "mesh"; acknowledged?: boolean }>;
   followUp(args: { id: string; message: string; data?: unknown }): Promise<{ queued: true; messageId: string; routed?: "local" | "main" | "mesh"; acknowledged?: boolean }>;
   setSteeringMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;

@@ -3,12 +3,15 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
+import { SettingsManager } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
 import type { FabricPrewalkMode, FabricResultFormat } from "../config.js";
 import {
   NESTED_TOOL_CALL_ID_PREFIX,
   type FabricCallAudit,
 } from "../core/action-registry.js";
 import type { CompactRequestIntent } from "../core/compact-controller.js";
+import { isOmpRoleSelector } from "../core/model-resolution.js";
+import { resolveOmpRole } from "../core/omp-model-role.js";
 import type { FabricExecutionResult } from "../execution-service.js";
 import type {
   FabricInvocationActivityUpdate,
@@ -330,7 +333,16 @@ const runInPlacePrewalk = async (
   pending: PendingFabricHandoff,
   context: ExtensionContext,
 ): Promise<Record<string, unknown>> => {
-  const modelKey = String(pending.args.model ?? "");
+  const selector = String(pending.args.model ?? "");
+  // @role selectors resolve here, at the boundary, against the session's live
+  // model roles — the arm deliberately stores the selector verbatim so re-arms
+  // re-resolve. An unresolvable role throws before setModel, so Main's model
+  // and thinking are never left half-switched; setModel then receives the
+  // session-resolved authenticated model and keeps Main's thinking behavior.
+  const resolved = isOmpRoleSelector(selector)
+    ? resolveOmpRole(selector, context, SettingsManager.create(context.cwd), true)
+    : undefined;
+  const modelKey = resolved?.model ?? selector;
   context.ui.setStatus("fabric-prewalk", `switching Main → ${modelKey}`);
   const model = modelForKey(modelKey, context);
   // Snapshot the pre-switch reasoning channel and branch. In-place handoff

@@ -15,9 +15,9 @@ const runProperties = {
     enum: ["auto", "process", "tmux", "screen", "localterm", "herdr"],
   },
   model: {
-    type: "string",
+    anyOf: [{ type: "string" }, { type: "array", items: { type: "string" }, minItems: 1 }],
     description:
-      "OMP provider/id, a configured models.aliases name, or a search term resolved to the closest authenticated model (recency from pi-model-sort breaks ties); Claude runtime value or Veda backend model/alias are forwarded verbatim.",
+      "OMP @role or comma-separated role candidates, provider/id, a configured models.aliases name, or a search term resolved to the closest authenticated model (recency from pi-model-sort breaks ties); Claude runtime value or Veda backend model/alias are forwarded verbatim.",
   },
   persona: {
     type: "string",
@@ -109,7 +109,7 @@ const handoffSchema = {
     transport: runProperties.transport,
     model: {
       ...runProperties.model,
-      description: "Explicit OMP provider/id target that will continue the inherited trajectory",
+      description: "Explicit OMP model selector that will continue the inherited trajectory",
     },
     thinking: runProperties.thinking,
     tools: runProperties.tools,
@@ -276,8 +276,8 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
       type: "object",
       properties: {
         model: {
-          type: "string",
-          description: "provider/id, alias name, or search term",
+          anyOf: [{ type: "string" }, { type: "array", items: { type: "string" }, minItems: 1 }],
+          description: "OMP @role candidates, provider/id, alias name, or search term",
         },
         provider: { type: "string" },
       },
@@ -528,7 +528,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
       type: "object",
       properties: {
         id: { type: "string" },
-        model: { type: "string" },
+        model: runProperties.model,
         scope: actorBindingScopeSchema,
       },
       required: ["id"],

@@ -39,6 +39,7 @@ export interface AgentRunRequest {
   runner?: FabricAgentRunner;
   transport?: FabricAgentTransport;
   model?: string;
+  nativeThinking?: "auto" | "inherit";
   /** Veda persona name; only used when runner is "veda". */
   persona?: string;
   thinking?: FabricThinking;

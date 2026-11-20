@@ -191,4 +191,32 @@ describe("PrewalkController", () => {
     controller.claimFsDrift("session-1", ["a.ts"]);
     expect(controller.failHandoff()).toMatchObject({ state: "armed" });
   });
+
+  it.each([
+    "@worker",
+    "@missing, @worker",
+    "anthropic/literal, @worker",
+  ])("arms an @role selector verbatim so consumers resolve it at their boundary: %s", (model) => {
+    const controller = new PrewalkController();
+    controller.arm({ model: `  ${model}  `, sessionId: "session-1", alwaysRearm: true });
+
+    const claim = controller.claim([audit("omp.edit", true)], "session-1");
+
+    expect(claim?.arm.model).toBe(model);
+    expect(controller.status()).toMatchObject({ state: "handing_off", model });
+    // alwaysRearm re-arms the same selector — never a resolved key — so the
+    // next boundary resolves against the session roles live at that moment.
+    expect(controller.completeTask()).toMatchObject({ state: "armed", model });
+  });
+
+  it.each(["plain-model", "", "   "])(
+    "still rejects non-role non-provider/model targets: %j",
+    (model) => {
+      const controller = new PrewalkController();
+      expect(() =>
+        controller.arm({ model, sessionId: "session-1" }),
+      ).toThrow("provider/model or @role");
+      expect(controller.status()).toEqual({ state: "idle" });
+    },
+  );
 });

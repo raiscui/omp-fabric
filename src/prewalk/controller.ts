@@ -1,5 +1,6 @@
 import type { FabricPrewalkMode } from "../config.js";
 import type { FabricCallAudit } from "../core/action-registry.js";
+import { isOmpRoleSelector } from "../core/model-resolution.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 
 const PREWALK_TRIGGER_REFS = new Set([
@@ -72,7 +73,12 @@ export class PrewalkController {
     thinking?: FabricThinking;
   }): FabricPrewalkStatus {
     const model = input.model.trim();
-    if (!model.includes("/")) throw new Error("Prewalk requires a provider/model executor target");
+    // The arm stores the selector verbatim: provider/model keys and @role
+    // fallback chains both defer resolution to the consumer boundary so a
+    // re-arm resolves against the session roles live at that moment.
+    if (!isOmpRoleSelector(model) && !model.includes("/")) {
+      throw new Error("Prewalk requires a provider/model or @role executor target");
+    }
     if (input.thinking !== undefined && !isFabricThinking(input.thinking)) {
       throw new Error(`Invalid prewalk thinking level: ${String(input.thinking)}`);
     }

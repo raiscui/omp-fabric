@@ -65,6 +65,7 @@ export type FabricActorStorageScope = "session" | "project";
 
 export interface FabricActorRunBinding {
   model?: string;
+  nativeThinking?: "auto" | "inherit";
   thinking?: FabricThinking;
 }
 
@@ -145,6 +146,7 @@ export interface FabricActorRequest {
   residency?: FabricParticipantResidency;
   runner?: FabricAgentRunner;
   model?: string;
+  nativeThinking?: "auto" | "inherit";
   thinking?: FabricThinking;
   tools?: string[];
   transport?: FabricAgentTransport;

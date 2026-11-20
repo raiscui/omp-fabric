@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { MeshIdentity } from "./mesh/store.js";
 
 const MAIN_AGENT_ALIAS = "main";
@@ -51,7 +52,7 @@ export interface FabricMainAgentTarget {
   // Switch Main's live session model in place. Only local hosts hold the OMP
   // extension session required for the mutation, so remote targets omit it.
   switchModel?(
-    target: { provider: string; id: string },
+    target: { provider: string; id: string; thinking?: import("./thinking.js").FabricThinking | "inherit" },
     context: ExtensionContext,
   ): Promise<FabricMainModelSwitchResult>;
 }
@@ -142,7 +143,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   async switchModel(
-    target: { provider: string; id: string },
+    target: { provider: string; id: string; thinking?: import("./thinking.js").FabricThinking | "inherit" },
     context: ExtensionContext,
   ): Promise<FabricMainModelSwitchResult> {
     if (!this.local) {
@@ -153,6 +154,10 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (!model) return { ok: false, error: `Model is not available: ${key}` };
     const switched = await this.omp.setModel(model);
     if (!switched) return { ok: false, error: `No authentication configured for model: ${key}` };
+    if (target.thinking) {
+      const levels = { off: ThinkingLevel.Off, minimal: ThinkingLevel.Minimal, low: ThinkingLevel.Low, medium: ThinkingLevel.Medium, high: ThinkingLevel.High, xhigh: ThinkingLevel.XHigh, max: ThinkingLevel.Max, inherit: ThinkingLevel.Inherit };
+      this.omp.setThinkingLevel(levels[target.thinking]);
+    }
     return { ok: true };
   }
 

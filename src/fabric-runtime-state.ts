@@ -1,4 +1,7 @@
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { SettingsManager } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
+import { resolveOmpRole } from "./core/omp-model-role.js";
+import { isOmpRoleSelector, validateNativeThinking } from "./core/model-resolution.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import {
   resolveAvailableOmpModel,
@@ -17,7 +20,7 @@ import { GlobalActorRegistry } from "./actors/global-registry.js";
 import { buildActorContext } from "./actors/context.js";
 import { actorDeliveryNotice } from "./actors/delivery-policy.js";
 import { prepareFabricActorHostPayload } from "./actors/host-event-payload.js";
-import type { FabricActorHostEvent } from "./actors/types.js";
+import type { FabricActorHostEvent, FabricActorRunBinding } from "./actors/types.js";
 import { CapturedToolCatalog, type CapturedToolEntry } from "./capture/catalog.js";
 import { FabricComponentCatalog } from "./components/catalog.js";
 import { FabricComponentLoader } from "./components/loader.js";
@@ -716,6 +719,7 @@ export class FabricRuntimeState {
       ? { ...this.#config.agents, enabled: false }
       : this.#config.agents;
     const modelsConfig = this.#config.models;
+    const ompSettings = SettingsManager.create(context.cwd);
     const visibleOmpModels = () => {
       try {
         return context.modelRegistry.getAvailable();
@@ -758,7 +762,7 @@ export class FabricRuntimeState {
             'Use agents.models({ runner: "omp" }) to list the models visible to this session.',
         );
       }
-      return { key: `${resolved.provider}/${resolved.id}`, model };
+      return { key: `${resolved.provider}/${resolved.id}`, model, available: state.available };
     };
     this.#agents = new AgentManager(context.cwd, agentConfig, {
       ...(this.#judgment ? { judgment: this.#judgment } : {}),
@@ -788,11 +792,13 @@ export class FabricRuntimeState {
           includeSlots: false,
         }).appendText || undefined;
       },
-      prepareOmpModel: async (modelKey) => {
-        const resolved = resolveParticipantOmpModel(modelKey);
+      prepareOmpModel: async (modelKey, explicitThinking, nativeThinking) => {
+        const role = modelKey && isOmpRoleSelector(modelKey) ? resolveOmpRole(modelKey, context, ompSettings, explicitThinking) : undefined;
+        const resolved = resolveParticipantOmpModel(role?.model ?? modelKey);
+        validateNativeThinking(resolved.key, explicitThinking ? undefined : nativeThinking ?? role?.nativeThinking, resolved.available);
         const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
         if (!auth.ok) throw new Error(auth.error);
-        return resolved.key;
+        return role ? { model: resolved.key, ...(role.thinking ? { thinking: role.thinking } : {}), ...(role.nativeThinking ? { nativeThinking: role.nativeThinking } : {}) } : resolved.key;
       },
       onLifecycle: (event) => {
         const lifecycle = this.#lifecycle;
@@ -829,6 +835,13 @@ export class FabricRuntimeState {
     const actorRoots = {
       project: path.join(meshRoot, "actors"),
       session: path.join(meshRoot, "actors", fabricSessionId),
+    };
+    const resolveActorBinding = (binding: FabricActorRunBinding): FabricActorRunBinding => {
+      if (!binding.model) return binding;
+      if (!isOmpRoleSelector(binding.model)) return { ...binding, model: resolveParticipantOmpModel(binding.model).key };
+      const role = resolveOmpRole(binding.model, context, ompSettings, binding.thinking !== undefined);
+      const thinking = binding.thinking ?? role.thinking;
+      return { model: role.model, ...(role.nativeThinking ? { nativeThinking: role.nativeThinking } : {}), ...(thinking ? { thinking } : {}) };
     };
     const acquireActorCapabilityView = (
       requirements: Parameters<ActionRegistry["acquireCapabilityView"]>[0],
@@ -880,6 +893,7 @@ export class FabricRuntimeState {
             rootId: mainAgentId,
             retention: this.#config.retention,
             resolveOmpModel: (model) => resolveParticipantOmpModel(model).key,
+            resolveOmpBinding: resolveActorBinding,
             acquireCapabilityView: acquireActorCapabilityView,
           }
         : {
@@ -891,6 +905,7 @@ export class FabricRuntimeState {
             rootId: mainAgentId,
             retention: this.#config.retention,
             resolveOmpModel: (model) => resolveParticipantOmpModel(model).key,
+            resolveOmpBinding: resolveActorBinding,
             acquireCapabilityView: acquireActorCapabilityView,
           },
     ], actorRoots, this.#config.mesh.actorScope);

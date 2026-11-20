@@ -4,6 +4,7 @@ import type { CapturedToolCatalog } from "../capture/catalog.js";
 import type { FabricActorHostEvent } from "../actors/types.js";
 import type { FabricState } from "../fabric-state.js";
 import { resolveAgentDir } from "../core/agent-dir.js";
+import { isOmpRoleSelector } from "../core/model-resolution.js";
 import { saveFabricConfig } from "../config.js";
 import { armFabricPrewalkSession } from "../prewalk/arm.js";
 import { truncateMiddle } from "../util.js";
@@ -113,9 +114,12 @@ const resolvePrewalkModel = async (
 ): Promise<string | undefined> => {
   const configured = state.config.prewalk.model?.trim();
   if (configured) {
-    if (configured.includes("/")) return configured;
+    // @role selectors (and comma fallback chains) stay verbatim: the arm keeps
+    // the selector so in-place and trajectory consumers resolve it against the
+    // session's live model roles at handoff time, covering re-arms too.
+    if (configured.includes("/") || isOmpRoleSelector(configured)) return configured;
     context.ui.notify(
-      "prewalk.model must use provider/model form.",
+      "prewalk.model must use provider/model form or an @role selector.",
       "error",
     );
     return undefined;

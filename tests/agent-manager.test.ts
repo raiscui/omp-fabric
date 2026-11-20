@@ -4,6 +4,7 @@ import path from "node:path";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG, MIN_AGENT_TIMEOUT_MS } from "../src/config.js";
+import { validateNativeThinking } from "../src/core/model-resolution.js";
 import type { FabricLifecyclePublishRequest } from "../src/lifecycle/types.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import {
@@ -390,6 +391,57 @@ describe("AgentManager", async () => {
     expect(
       fs.readFileSync(path.join(manager.runDirectory(result.id)!, "startup-attempts"), "utf8"),
     ).toBe("2");
+  }, 30_000);
+
+  it.each([
+    ["auto", "fake-worker-startup-retry.mjs"],
+    ["inherit", "fake-worker-startup-retry.mjs"],
+    ["auto", "fake-worker-transport-death.mjs"],
+    ["inherit", "fake-worker-transport-death.mjs"],
+  ] as const)("rejects a native %s collision introduced before retry after %s", async (mode, worker) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-fabric-manager-"));
+    roots.push(root);
+    let calls = 0;
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures", worker),
+      runRoot: root,
+      prepareOmpModel: async (model, _explicit, nativeThinking) => {
+        calls++;
+        const available = [{ provider: "provider", id: "model" }];
+        if (calls > 1) available.push({ provider: "PROVIDER", id: `MODEL:${mode.toUpperCase()}` });
+        validateNativeThinking(model ?? "", nativeThinking, available);
+        return model;
+      },
+    });
+    managers.push(manager);
+    const result = await manager.run({ task: "Recover startup", transport: "process", model: "provider/model", nativeThinking: mode });
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain(`OMP role native thinking selector conflicts with a literal model ID: provider/model:${mode}`);
+    expect(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "startup-attempts"), "utf8")).toBe("1");
+  }, 30_000);
+
+  it.each([
+    ["fake-worker-startup-retry.mjs", "No API key found for openai-codex", true],
+    ["fake-worker-transport-death.mjs", "Agent transport exited without a result", false],
+  ] as const)("preserves ordinary retry preparation failures after %s", async (worker, originalError, persistedRetryError) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-fabric-manager-"));
+    roots.push(root);
+    let calls = 0;
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures", worker),
+      runRoot: root,
+      prepareOmpModel: async (model) => {
+        if (++calls > 1) throw new Error("retry lookup unavailable");
+        return model;
+      },
+    });
+    managers.push(manager);
+    const result = await manager.run({ task: "Recover startup", transport: "process", model: "provider/model" });
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain(originalError);
+    expect(result.error).not.toContain("retry lookup unavailable");
+    const record = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "status.json"), "utf8")) as AgentRunRecord;
+    expect(record.error?.includes("retry lookup unavailable")).toBe(persistedRetryError);
   }, 30_000);
 
   it("does not retry deterministic failures before the first turn", async () => {
@@ -946,6 +998,60 @@ describe("AgentManager", async () => {
     });
     expect(result.status).toBe("completed");
     expect(result.thinking).toBe("max");
+  });
+
+  it.each(["auto", "inherit"])("passes native %s through the model selector and suppresses --thinking", async (mode) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot: root,
+      fullCodeMode: false,
+      prepareOmpModel: async (model) =>
+        model === "@fast"
+          ? { model: "provider/model", nativeThinking: mode as "auto" | "inherit" }
+          : model,
+    });
+    managers.push(manager);
+    const result = await manager.run({
+      task: "Run with native thinking",
+      transport: "process",
+      model: "@fast",
+      nativeThinking: mode as "auto" | "inherit",
+    });
+    expect(result.status).toBe("completed");
+    expect(result.model).toBe("provider/model");
+    expect(result.thinking).toBeUndefined();
+    const status = JSON.parse(
+      fs.readFileSync(path.join(manager.runDirectory(result.id)!, "status.json"), "utf8"),
+    ) as { model?: string; thinking?: string };
+    expect(status.model).toBe(`provider/model:${mode}`);
+    expect(status.thinking).toBeUndefined();
+  });
+
+  it("keeps an explicit thinking ahead of native role thinking", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot: root,
+      fullCodeMode: false,
+    });
+    managers.push(manager);
+    const result = await manager.run({
+      task: "Explicit thinking wins",
+      transport: "process",
+      model: "provider/model",
+      nativeThinking: "auto",
+      thinking: "low",
+    });
+    expect(result.status).toBe("completed");
+    expect(result.thinking).toBe("low");
+    const status = JSON.parse(
+      fs.readFileSync(path.join(manager.runDirectory(result.id)!, "status.json"), "utf8"),
+    ) as { model?: string; thinking?: string };
+    expect(status.model).toBe("provider/model");
+    expect(status.thinking).toBe("low");
   });
 
   it("forwards the medium default when neither config nor call set a thinking level", async () => {

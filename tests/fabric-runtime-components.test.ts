@@ -191,6 +191,44 @@ describe("Fabric runtime provider components", () => {
     }
   });
 
+  it.each([
+    ["auto", "visible:auto"], ["auto", "VISIBLE:auto"], ["auto", "visible:AUTO"], ["auto", "VISIBLE:AUTO"],
+    ["inherit", "visible:inherit"], ["inherit", "VISIBLE:inherit"], ["inherit", "visible:INHERIT"], ["inherit", "VISIBLE:INHERIT"],
+  ] as const)("rechecks live native %s against literal %s", async (mode, literalId) => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-fabric-runtime-model-"));
+    fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
+    vi.stubEnv("OMP_FABRIC_AGENT_DIR", path.join(cwd, "agent"));
+    vi.stubEnv("OMP_FABRIC_PROJECT_ROOT", cwd);
+    const models = [{ provider: "provider", id: "visible", name: "Visible" }];
+    const omp = { events: { emit: vi.fn() }, getThinkingLevel: vi.fn(), sendMessage: vi.fn() } as unknown as ExtensionAPI;
+    const context = {
+      cwd, hasUI: false, isProjectTrusted: () => true, isIdle: () => true, hasPendingMessages: () => false,
+      modelRegistry: { getAvailable: () => models, getApiKeyAndHeaders: async () => ({ ok: true }) },
+      sessionManager: { getSessionId: () => "runtime-model-session", getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => undefined },
+      ui: { setStatus: vi.fn(), notify: vi.fn() },
+    } as unknown as ExtensionContext;
+    const config = normalizeFabricConfig({ fullCodeMode: false, mcp: { enabled: false }, mesh: { enabled: false }, memory: { enabled: false }, residency: { enabled: false }, prewalk: { enabled: false } });
+    const runtime = new FabricRuntimeState(omp, new CapturedToolCatalog(), {
+      paths: { extension: path.resolve("tests/fixtures/fake-worker.mjs"), worker: path.resolve("tests/fixtures/fake-worker.mjs"), residentHost: path.resolve("tests/fixtures/fake-worker.mjs"), skills: cwd },
+    });
+    try {
+      await runtime.initialize(context, config);
+      const first = await runtime.agents.run({ task: "first", runner: "omp", transport: "process", model: "provider/visible", nativeThinking: mode });
+      expect(first.status).toBe("completed");
+      expect(first.model).toBe("provider/visible");
+      await expect(runtime.agents.spawn({ task: "unknown literal", runner: "omp", model: `provider/visible:${mode}` })).rejects.toThrow("not available to this OMP session");
+      models.push({ provider: "provider", id: literalId, name: "Literal" });
+      await expect(runtime.agents.spawn({ task: "collision", runner: "omp", model: "provider/visible", nativeThinking: mode })).rejects.toThrow(`OMP role native thinking selector conflicts with a literal model ID: provider/visible:${mode}`);
+      const literal = await runtime.agents.run({ task: "literal", runner: "omp", transport: "process", model: `provider/visible:${mode}` });
+      expect(literal.status).toBe("completed");
+      expect(literal.model).toBe(`provider/${literalId}`);
+    } finally {
+      await runtime.shutdown();
+      vi.unstubAllEnvs();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("freezes repair surfaces across capture suspension and reload", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-fabric-runtime-repairs-"));
     fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });

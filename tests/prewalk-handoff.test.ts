@@ -1,8 +1,11 @@
 import {
   SessionManager,
+  Settings,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
+import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentToolResultMessage } from "../src/agents/types.js";
 import type { FabricExecutionResult } from "../src/execution-service.js";
@@ -1330,5 +1333,278 @@ describe("filesystem-drift prewalk claims", () => {
       ),
     ).toBeUndefined();
     expect(controller.status()).toMatchObject({ state: "armed" });
+  });
+});
+
+// @role and comma fallback chains: the arm stores the selector verbatim and
+// each consumer resolves it through resolveOmpRole + SettingsManager.create(
+// context.cwd) at its own boundary — in-place switches Main to the resolved
+// authenticated model (Main's thinking untouched), trajectory passes the
+// selector to agents.handoff's own session resolution.
+
+type RoleCandidate = { provider: string; id: string; name?: string; reasoning?: boolean };
+
+// Same surface resolveOmpRole consumes: getAvailable() supplies the
+// authenticated set, models.resolve mirrors the host's session resolution.
+const roleContext = (
+  roles: Record<string, string>,
+  available: RoleCandidate[],
+  current: RoleCandidate = { provider: "anthropic", id: "frontier" },
+) => {
+  const settings = Settings.isolated({ modelRoles: roles });
+  const registry = [...available, current];
+  const models = registry as unknown as ReturnType<ExtensionContext["modelRegistry"]["getAvailable"]>;
+  const base = context();
+  const value = {
+    ...base.value,
+    model: current,
+    modelRegistry: {
+      getAvailable: () => models,
+      find: (provider: string, id: string) =>
+        registry.find((entry) => entry.provider === provider && entry.id === id),
+    },
+    models: {
+      resolve: (selector: string) =>
+        resolveModelRoleValue(selector, models, { settings }).model,
+    },
+  } as unknown as ExtensionContext;
+  return { settings, ctx: { ...base, value } };
+};
+
+describe("prewalk @role selectors", () => {
+  const roles = {
+    missing: "test/not-present",
+    worker: "anthropic/executor:high",
+  };
+  const available: RoleCandidate[] = [
+    { provider: "anthropic", id: "executor", reasoning: true },
+    { provider: "openai", id: "gpt-5", reasoning: true },
+  ];
+
+  it("switches Main in place to the session-resolved role model without touching thinking", async () => {
+    const { settings, ctx } = roleContext(roles, available);
+    const controller = new PrewalkController();
+    controller.arm({
+      model: "@missing, @worker",
+      sessionId: "session-1",
+      task: "Implement the guard",
+    });
+    const run = execution();
+    const pending = claimFabricHandoff(controller, run, "session-1", "json");
+    expect(pending).toMatchObject({
+      kind: "prewalk-in-place",
+      args: { model: "@missing, @worker" },
+    });
+
+    const ext = extension();
+    const result = await withActiveSettings(settings, () =>
+      runFabricHandoffAtBoundary(
+        controller,
+        unusedRunner(),
+        ext.value,
+        pending!,
+        outerResult(),
+        ctx.value,
+      ),
+    );
+
+    // @missing falls back to @worker → anthropic/executor; setModel sees the
+    // resolved Model entry and Main's thinking is never set by prewalk.
+    expect(ext.setModel).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: "anthropic", id: "executor" }),
+    );
+    expect(ext.setModel).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      mode: "in-place",
+      continued: true,
+      model: "anthropic/executor",
+    });
+    expect(controller.status()).toMatchObject({
+      state: "continuation_pending",
+      returnModel: "anthropic/frontier",
+    });
+  });
+
+  it("re-resolves the stored selector on each claim so a runtime role override moves the next boundary", async () => {
+    const { settings, ctx } = roleContext(roles, available);
+    const controller = new PrewalkController();
+    controller.arm({
+      model: "@worker",
+      sessionId: "session-1",
+      alwaysRearm: true,
+    });
+    const ext = extension();
+
+    const first = claimFabricHandoff(controller, execution(), "session-1", "json");
+    const firstResult = await withActiveSettings(settings, () =>
+      runFabricHandoffAtBoundary(controller, unusedRunner(), ext.value, first!, outerResult(), ctx.value),
+    );
+    expect(firstResult).toMatchObject({ model: "anthropic/executor" });
+
+    // Return from the in-place continuation: alwaysRearm re-arms @worker.
+    const status = controller.status();
+    expect(status.state).toBe("continuation_pending");
+    if (status.state !== "continuation_pending") throw new Error("Missing continuation");
+    controller.acceptContinuation("session-1", status.continuationId);
+    const returned = await withActiveSettings(settings, () => settleInPlacePrewalk(controller, ext.value, ctx.value));
+    expect(returned).toBe(true);
+    expect(controller.status()).toMatchObject({ state: "armed", model: "@worker" });
+    expect(ext.setModel).toHaveBeenLastCalledWith(
+      expect.objectContaining({ provider: "anthropic", id: "frontier" }),
+    );
+
+    // The session retargets @worker at runtime; the stored selector resolves
+    // against the new binding on the next boundary.
+    settings.overrideModelRoles({ worker: "openai/gpt-5:low" });
+    const second = claimFabricHandoff(controller, execution(), "session-1", "json");
+    const secondResult = await withActiveSettings(settings, () =>
+      runFabricHandoffAtBoundary(controller, unusedRunner(), ext.value, second!, outerResult(), ctx.value),
+    );
+    expect(secondResult).toMatchObject({ model: "openai/gpt-5" });
+    expect(ext.setModel).toHaveBeenLastCalledWith(
+      expect.objectContaining({ provider: "openai", id: "gpt-5" }),
+    );
+  });
+
+  it.each(["@ghost", "@, @"])("fails unresolved selector %s without switching Main", async (selector) => {
+    const { settings, ctx } = roleContext(roles, available);
+    const controller = new PrewalkController();
+    controller.arm({ model: selector, sessionId: "session-1", alwaysRearm: true });
+    const pending = claimFabricHandoff(controller, execution(), "session-1", "json");
+    const ext = extension();
+
+    const result = await withActiveSettings(settings, () =>
+      runFabricHandoffAtBoundary(controller, unusedRunner(), ext.value, pending!, outerResult(), ctx.value),
+    );
+
+    expect(result).toMatchObject({
+      prewalk: true,
+      mode: "in-place",
+      status: "failed",
+      error: expect.stringContaining(selector),
+    });
+    expect(ext.setModel).not.toHaveBeenCalled();
+    expect(controller.status()).toMatchObject({ state: "armed", model: selector });
+    expect(ext.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ customType: "omp-fabric-prewalk-failure" }),
+      { deliverAs: "followUp", triggerTurn: true },
+    );
+  });
+
+  it.each(["auto", "inherit"])("keeps Main thinking when a role selects native %s", async (thinking) => {
+    const { settings, ctx } = roleContext({ worker: `anthropic/executor:${thinking}` }, available);
+    const controller = new PrewalkController();
+    controller.arm({ model: "@worker", sessionId: "session-1", thinking: "low" });
+    const pending = claimFabricHandoff(controller, execution(), "session-1", "json");
+    const ext = extension();
+    const result = await withActiveSettings(settings, () =>
+      runFabricHandoffAtBoundary(controller, unusedRunner(), ext.value, pending!, outerResult(), ctx.value),
+    );
+    expect(result).toMatchObject({ continued: true, model: "anthropic/executor" });
+    expect(ext.setModel).toHaveBeenCalledTimes(1);
+    expect(ext.setModel).toHaveBeenCalledWith(expect.objectContaining({ provider: "anthropic", id: "executor" }));
+  });
+
+  it("keeps literal provider/model in-place behavior with no roles configured", async () => {
+    const { settings, ctx } = roleContext({}, available);
+    const controller = new PrewalkController();
+    controller.arm({ model: "anthropic/executor", sessionId: "session-1" });
+    const pending = claimFabricHandoff(controller, execution(), "session-1", "json");
+    const ext = extension();
+
+    const result = await withActiveSettings(settings, () =>
+      runFabricHandoffAtBoundary(controller, unusedRunner(), ext.value, pending!, outerResult(), ctx.value),
+    );
+
+    expect(result).toMatchObject({ mode: "in-place", continued: true, model: "anthropic/executor" });
+    expect(ext.setModel).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: "anthropic", id: "executor" }),
+    );
+  });
+
+  it("hands a trajectory arm the verbatim selector and explicit thinking", async () => {
+    const { settings, ctx } = roleContext(roles, available);
+    const controller = new PrewalkController();
+    controller.arm({
+      model: "@missing, @worker",
+      mode: "trajectory",
+      sessionId: "session-1",
+      task: "Implement the guard",
+      thinking: "low",
+    });
+    const pending = claimFabricHandoff(controller, execution(), "session-1", "json");
+    // agents.handoff receives the selector as-is and resolves it against the
+    // session itself; explicit prewalk.thinking wins over the role's level.
+    expect(pending).toMatchObject({
+      kind: "prewalk-trajectory",
+      args: { model: "@missing, @worker", thinking: "low", task: "Implement the guard" },
+      audit: { ref: "agents.handoff" },
+    });
+
+    const ext = extension();
+    const runner = {
+      executeHandoff: vi.fn(async () => ({ completed: true, status: "completed" })),
+    };
+    const result = await withActiveSettings(settings, () =>
+      runFabricHandoffAtBoundary(controller, runner, ext.value, pending!, outerResult(), ctx.value),
+    );
+
+    expect(runner.executeHandoff).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "@missing, @worker", thinking: "low" }),
+      expect.objectContaining({ extensionContext: ctx.value }),
+      expect.anything(),
+    );
+    expect(result).toMatchObject({ mode: "trajectory", completed: true });
+  });
+
+  it("omits args.thinking for a role selector without explicit prewalk.thinking so the role's level applies", async () => {
+    const { settings, ctx } = roleContext(roles, available);
+    const controller = new PrewalkController();
+    controller.arm({
+      model: "@worker",
+      mode: "trajectory",
+      sessionId: "session-1",
+    });
+    const pending = claimFabricHandoff(controller, execution(), "session-1", "json");
+    expect(pending?.args).not.toHaveProperty("thinking");
+
+    const runner = {
+      executeHandoff: vi.fn(async () => ({ completed: true, status: "completed" })),
+    };
+    await withActiveSettings(settings, () =>
+      runFabricHandoffAtBoundary(controller, runner, extension().value, pending!, outerResult(), ctx.value),
+    );
+    expect(runner.executeHandoff).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "@worker" }),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(runner.executeHandoff).not.toHaveBeenCalledWith(
+      expect.objectContaining({ thinking: expect.anything() }),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it("fails a trajectory handoff on an unresolvable role without spawning", async () => {
+    const { settings, ctx } = roleContext(roles, available);
+    const controller = new PrewalkController();
+    controller.arm({ model: "@ghost", mode: "trajectory", sessionId: "session-1", alwaysRearm: true });
+    const pending = claimFabricHandoff(controller, execution(), "session-1", "json");
+
+    // The provider-side executeHandoff resolves the verbatim selector through
+    // resolveOmpRole and throws before spawn; mimic that failure surface.
+    const runner = {
+      executeHandoff: vi.fn(async () => {
+        throw new Error('OMP role selector "@ghost" did not resolve against this session\'s model roles and authenticated models');
+      }),
+    };
+    const result = await withActiveSettings(settings, () =>
+      runFabricHandoffAtBoundary(controller, runner, extension().value, pending!, outerResult(), ctx.value),
+    );
+
+    expect(result).toMatchObject({ mode: "trajectory", status: "failed" });
+    expect(String(result.error)).toContain("@ghost");
+    expect(controller.status()).toMatchObject({ state: "armed", model: "@ghost" });
   });
 });

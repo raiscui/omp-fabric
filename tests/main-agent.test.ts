@@ -197,6 +197,23 @@ describe("MainAgentController.switchModel", () => {
     expect(setModel).toHaveBeenCalledWith(model);
   });
 
+  it.each(["inherit", "high"])("applies %s thinking through the official host API", async (thinking) => {
+    const model = { provider: "google", id: "gemini-2.5-flash" };
+    const setModel = vi.fn(async () => true);
+    const setThinkingLevel = vi.fn();
+    const omp = { setModel, setThinkingLevel } as unknown as ExtensionAPI;
+    const controller = new MainAgentController(omp, "session:root", true, "/tmp/project", "root");
+
+    await expect(
+      controller.switchModel(
+        { provider: "google", id: "gemini-2.5-flash", thinking: thinking as "inherit" },
+        buildContext(model),
+      ),
+    ).resolves.toEqual({ ok: true });
+    expect(setModel).toHaveBeenCalledWith(model);
+    expect(setThinkingLevel).toHaveBeenCalledWith(thinking);
+  });
+
   it("fails when the registry cannot resolve the model", async () => {
     const setModel = vi.fn(async () => true);
     const omp = { setModel } as unknown as ExtensionAPI;

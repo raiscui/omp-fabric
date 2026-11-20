@@ -20,6 +20,24 @@ afterEach(() => {
 });
 
 describe("ActorBindingStore", () => {
+  it("persists native role thinking without inheriting an older session effort", async () => {
+    const { first, second } = setup();
+    await first.setThinking("actor:a", "high");
+    await first.setModel("actor:a", "provider/model", undefined, true, "inherit");
+    expect(second.get("actor:a")).toMatchObject({ model: "provider/model", nativeThinking: "inherit" });
+    expect(second.get("actor:a")?.thinking).toBeUndefined();
+    await second.setModel("actor:a", "provider/model:inherit");
+    expect(first.get("actor:a")?.nativeThinking).toBe("inherit");
+  });
+
+  it("publishes a model and its role thinking in one binding", async () => {
+    const { first, second } = setup();
+    await first.setModel("actor:a", "provider/old");
+    await first.setThinking("actor:a", "low");
+    await first.setModel("actor:a", "provider/new", "high");
+    expect(second.get("actor:a")).toMatchObject({ model: "provider/new", thinking: "high" });
+  });
+
   it("merges unrelated writes from stale stores under one session lock", async () => {
     const { first, second } = setup();
 

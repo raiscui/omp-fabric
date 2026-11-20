@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { Settings, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { FabricPrewalkMode } from "../src/config.js";
 import type { FabricState } from "../src/fabric-state.js";
 import { armFabricPrewalkSession, autoArmFabricPrewalk } from "../src/prewalk/arm.js";
@@ -198,7 +199,7 @@ describe("autoArmFabricPrewalk", () => {
       reason: "prewalk.model",
     },
     {
-      name: "prewalk.model not provider/model",
+      name: "prewalk.model not provider/model or @role",
       harness: { model: "plain-model" },
       reason: "prewalk.model",
     },
@@ -211,5 +212,33 @@ describe("autoArmFabricPrewalk", () => {
     expect(h.prewalk.status().state).toBe("idle");
     expect(h.sendMessage).not.toHaveBeenCalled();
     expect(h.captureBaseline).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "@worker",
+    "@missing, @worker, anthropic/literal",
+    "anthropic/literal, @worker",
+  ])("auto-arms with the verbatim role-capable selector %s", async (model) => {
+    const h = makeHarness({ model });
+    const settings = Settings.isolated({
+      modelRoles: { worker: "anthropic/executor:high" },
+    });
+
+    const skip = await withActiveSettings(settings, () =>
+      autoArmFabricPrewalk(h.state, h.context, h.omp),
+    );
+
+    expect(skip).toBeUndefined();
+    // The selector, not a resolved model key: consumers resolve it against the
+    // session's live roles at their own boundary, so a later role override or
+    // a re-arm sees the then-current binding.
+    expect(h.prewalk.status()).toMatchObject({ state: "armed", model });
+    expect(h.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: PREWALK_ARMED_MESSAGE_TYPE,
+        details: expect.objectContaining({ model }),
+      }),
+      { deliverAs: "nextTurn" },
+    );
   });
 });

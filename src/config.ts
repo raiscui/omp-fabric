@@ -848,7 +848,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   );
   const prewalkModel = stringValue(prewalk.model);
   const prewalkThinking = isFabricThinking(prewalk.thinking) ? prewalk.thinking : undefined;
-  const agentModel = stringValue(agents.model);
+  const agentModel = stringValue(agents.model) ?? (Array.isArray(agents.model) && agents.model.length > 0 && agents.model.every((value: unknown) => typeof value === "string" && value.trim()) && agents.model.some((value: string) => value.trim().startsWith("@")) ? agents.model.join(",") : undefined);
   const claudeBinary = stringValue(claude.binary);
   const claudeModel = stringValue(claude.model);
   const vedaBinary = stringValue(veda.binary);

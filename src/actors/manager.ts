@@ -82,6 +82,7 @@ interface ManagedActor {
   runner: FabricAgentRunner;
   runnerSessionId?: string;
   model?: string;
+  nativeThinking?: "auto" | "inherit";
   thinking?: FabricThinking;
   tools?: string[];
   transport?: FabricAgentTransport;
@@ -275,6 +276,7 @@ export class ActorManager {
   readonly #mainAgent: FabricMainAgentTarget | undefined;
   readonly #canManageActor: ((id: string) => boolean | undefined) | undefined;
   readonly #resolveOmpModel: ((model: string) => string) | undefined;
+  readonly #resolveOmpBinding: ((binding: FabricActorRunBinding) => FabricActorRunBinding) | undefined;
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
@@ -331,6 +333,7 @@ export class ActorManager {
       mainAgent?: FabricMainAgentTarget;
       canManageActor?: (id: string) => boolean | undefined;
       resolveOmpModel?: (model: string) => string;
+      resolveOmpBinding?: (binding: FabricActorRunBinding) => FabricActorRunBinding;
       lineageAlive?: (rootId: string) => boolean;
       adoptionGraceMs?: number;
       claimResidency?: FabricParticipantResidency;
@@ -351,6 +354,7 @@ export class ActorManager {
     this.#mainAgent = options.mainAgent;
     this.#canManageActor = options.canManageActor;
     this.#resolveOmpModel = options.resolveOmpModel;
+    this.#resolveOmpBinding = options.resolveOmpBinding;
     this.#lineageAlive = options.lineageAlive;
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
     this.#claimResidency = options.claimResidency;
@@ -464,6 +468,7 @@ export class ActorManager {
       residency,
       runner,
       ...(model ? { model } : {}),
+      ...(request.nativeThinking ? { nativeThinking: request.nativeThinking } : {}),
       ...(request.thinking ? { thinking: request.thinking } : {}),
       ...(request.tools ? { tools: [...new Set(request.tools)] } : {}),
       ...(request.transport ? { transport: request.transport } : {}),
@@ -564,6 +569,9 @@ export class ActorManager {
     id: string,
     model: string | undefined,
     scope: FabricActorBindingScope = "session",
+    thinking?: FabricThinking,
+    replaceThinking = false,
+    nativeThinking?: "auto" | "inherit",
   ): Promise<FabricActorInfo> {
     if (scope !== "session" && scope !== "project") {
       throw new Error(`Invalid Fabric actor binding scope: ${String(scope)}`);
@@ -577,12 +585,16 @@ export class ActorManager {
         : next
       : undefined;
     if (scope === "session") {
-      await this.#bindings.setModel(actor.id, resolved);
+      await this.#bindings.setModel(actor.id, resolved, thinking, replaceThinking, nativeThinking);
       await this.#publishBindingView(actor);
       return this.#publicInfo(actor);
     }
     if (resolved) actor.model = resolved;
     else delete actor.model;
+    if (nativeThinking) actor.nativeThinking = nativeThinking;
+    else if (replaceThinking || thinking !== undefined) delete actor.nativeThinking;
+    if (thinking !== undefined) actor.thinking = thinking;
+    else if (replaceThinking) delete actor.thinking;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -615,6 +627,7 @@ export class ActorManager {
     const actor = this.#requireOwnedActor(id);
     if (next) actor.thinking = next;
     else delete actor.thinking;
+    delete actor.nativeThinking;
     actor.updatedAt = Date.now();
     await this.#publishPresence(actor);
     return this.#publicInfo(actor);
@@ -854,6 +867,7 @@ export class ActorManager {
       ...(actor.residency === "durable" ? { residency: "durable" as const } : {}),
       runner: actor.runner,
       ...(actor.model ? { model: actor.model } : {}),
+      ...(actor.nativeThinking ? { nativeThinking: actor.nativeThinking } : {}),
       ...(actor.thinking ? { thinking: actor.thinking } : {}),
       ...(actor.tools ? { tools: [...actor.tools] } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
@@ -1556,6 +1570,7 @@ export class ActorManager {
       ...(actor.responseMode === "directive" ? { schema: directiveSchema } : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
       ...(item.binding.model ? { model: item.binding.model } : {}),
+      ...(item.binding.nativeThinking ? { nativeThinking: item.binding.nativeThinking } : {}),
       ...(item.binding.thinking ? { thinking: item.binding.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
@@ -1988,6 +2003,7 @@ export class ActorManager {
       runner: actor.runner,
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
       ...(actor.model ? { model: actor.model } : {}),
+      ...(actor.nativeThinking ? { nativeThinking: actor.nativeThinking } : {}),
       ...(actor.thinking ? { thinking: actor.thinking } : {}),
       ...(actor.tools ? { tools: actor.tools } : {}),
       ...(actor.transport ? { transport: actor.transport } : {}),
@@ -2228,6 +2244,7 @@ export class ActorManager {
           : {}),
         ...(typeof record.model === "string" ? { model: record.model } : {}),
         ...(isFabricThinking(record.thinking) ? { thinking: record.thinking } : {}),
+      ...(record.nativeThinking === "auto" || record.nativeThinking === "inherit" ? { nativeThinking: record.nativeThinking } : {}),
         ...(Array.isArray(record.tools)
           ? { tools: record.tools.filter((tool): tool is string => typeof tool === "string") }
           : {}),
@@ -2289,6 +2306,9 @@ export class ActorManager {
     actor: ManagedActor,
     binding: FabricActorRunBinding,
   ): FabricActorRunBinding {
+    if (actor.runner === "omp" && binding.model && this.#resolveOmpBinding) {
+      return this.#resolveOmpBinding(binding);
+    }
     return binding.model
       ? { ...binding, model: this.#resolvedModel(actor.runner, binding.model) }
       : binding;
@@ -2302,6 +2322,7 @@ export class ActorManager {
     return {
       ...(model ? { model } : {}),
       ...(isFabricThinking(binding.thinking) ? { thinking: binding.thinking } : {}),
+      ...(binding.nativeThinking === "auto" || binding.nativeThinking === "inherit" ? { nativeThinking: binding.nativeThinking } : {}),
     };
   }
 
@@ -2312,10 +2333,13 @@ export class ActorManager {
     const session = this.#bindings.get(actor.id);
     const call = this.#validatedRunBinding(overrides);
     const model = call.model ?? session?.model ?? actor.model;
-    const thinking = call.thinking ?? session?.thinking ?? actor.thinking;
+    const selected = call.thinking || call.nativeThinking ? call : session?.thinking || session?.nativeThinking ? session : actor;
+    const thinking = selected.thinking;
+    const nativeThinking = selected.nativeThinking;
     return {
       ...(model ? { model } : {}),
       ...(thinking ? { thinking } : {}),
+      ...(nativeThinking && !thinking ? { nativeThinking } : {}),
     };
   }
 
@@ -2342,12 +2366,14 @@ export class ActorManager {
         scope: "session",
         sessionId: this.sessionId,
         ...(session?.model ? { model: session.model } : {}),
+        ...(session?.nativeThinking ? { nativeThinking: session.nativeThinking } : {}),
         ...(session?.thinking ? { thinking: session.thinking } : {}),
         ...(session ? { updatedAt: session.updatedAt } : {}),
       },
       projectDefaults: {
         scope: "project",
         ...(actor.model ? { model: actor.model } : {}),
+        ...(actor.nativeThinking ? { nativeThinking: actor.nativeThinking } : {}),
         ...(actor.thinking ? { thinking: actor.thinking } : {}),
       },
       ...(actor.tools ? { tools: [...actor.tools] } : {}),

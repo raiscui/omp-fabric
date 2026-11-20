@@ -175,6 +175,25 @@ return { answer, binding: session.binding, defaults: session.projectDefaults };
     );
     expect(result.errors).toEqual([]);
   });
+
+  it("exposes actor native thinking bindings and role-resolved switch thinking", () => {
+    const result = typeCheckFabricCode(
+      `
+const native: Array<"auto" | "inherit" | undefined> = [];
+const session = await agents.setModel({
+  id: "reviewer",
+  model: "anthropic/session-model:auto",
+});
+native.push(session.binding?.nativeThinking, session.projectDefaults?.nativeThinking);
+const applied = await agents.switchModel({ model: "@reviewer" });
+const levels: Array<FabricThinking | "inherit" | undefined> = [applied.thinking];
+const baseline = await agents.switchModel({ model: "anthropic/claude-sonnet-4-5" });
+return { native, levels, via: baseline.via, alias: baseline.alias, reason: baseline.reason };
+`,
+      GUEST_TYPE_DECLARATIONS,
+    );
+    expect(result.errors).toEqual([]);
+  });
   it("rejects unknown memory arguments", () => {
     const result = typeCheckFabricCode(
       'return memory.expand({ session: "session-id", befroe: 2 });',

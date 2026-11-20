@@ -542,4 +542,153 @@ describe("/fabric command", () => {
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("prewalk is disabled"), "error");
   });
 
+  it("arms prewalk with a configured @role selector verbatim", async () => {
+    let handler: ((argumentsText: string, context: ExtensionContext) => Promise<void>) | undefined;
+    const sendUserMessage = vi.fn();
+    const sendMessage = vi.fn();
+    const omp = {
+      sendUserMessage,
+      sendMessage,
+      registerCommand: vi.fn((_name: string, definition: { handler: typeof handler }) => {
+        handler = definition.handler;
+      }),
+    } as unknown as ExtensionAPI;
+    const arm = vi.fn();
+    const state = {
+      ensure: vi.fn().mockResolvedValue(undefined),
+      config: {
+        fullCodeMode: true,
+        schema: { mode: "off" },
+        prewalk: { mode: "in-place", model: "@worker" },
+        agents: { enabled: true },
+      },
+      prewalk: { arm, status: vi.fn(), cancel: vi.fn() },
+    } as unknown as FabricState;
+    const context = {
+      sessionManager: { getSessionId: () => "session-1", getBranch: () => [] },
+      ui: { setStatus: vi.fn(), notify: vi.fn(), select: vi.fn() },
+    } as unknown as ExtensionContext;
+
+    registerFabricCommand(omp, {
+      state,
+      fabricUi: {} as FabricUiController,
+      capturedTools: {} as CapturedToolCatalog,
+      applyFabricMode: vi.fn(),
+      suspendToolCapture: vi.fn(),
+      autoArmPrewalk: vi.fn(async () => {}),
+    });
+    await handler!("prewalk Implement the token guard", context);
+
+    // The selector stays verbatim — the boundary consumer resolves it against
+    // the session's live roles, and re-arm resolves it again then.
+    expect(arm).toHaveBeenCalledWith({
+      model: "@worker",
+      mode: "in-place",
+      sessionId: "session-1",
+      task: "Implement the token guard",
+    });
+    expect(sendUserMessage).toHaveBeenCalledWith("Implement the token guard");
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: PREWALK_ARMED_MESSAGE_TYPE,
+        details: { mode: "in-place", model: "@worker" },
+      }),
+      { deliverAs: "nextTurn" },
+    );
+    // No picker and no resolution error for a role selector.
+    expect(context.ui.select).not.toHaveBeenCalled();
+    expect(context.ui.notify).not.toHaveBeenCalledWith(
+      expect.stringContaining("provider/model"),
+      "error",
+    );
+  });
+
+  it("arms prewalk with a comma fallback chain verbatim", async () => {
+    let handler: ((argumentsText: string, context: ExtensionContext) => Promise<void>) | undefined;
+    const omp = {
+      sendUserMessage: vi.fn(),
+      sendMessage: vi.fn(),
+      registerCommand: vi.fn((_name: string, definition: { handler: typeof handler }) => {
+        handler = definition.handler;
+      }),
+    } as unknown as ExtensionAPI;
+    const arm = vi.fn();
+    const state = {
+      ensure: vi.fn().mockResolvedValue(undefined),
+      config: {
+        fullCodeMode: true,
+        schema: { mode: "off" },
+        prewalk: { mode: "trajectory", model: "@missing, @worker, anthropic/literal" },
+        agents: { enabled: true },
+      },
+      prewalk: { arm, status: vi.fn(), cancel: vi.fn() },
+    } as unknown as FabricState;
+    const context = {
+      sessionManager: { getSessionId: () => "session-1", getBranch: () => [] },
+      ui: { setStatus: vi.fn(), notify: vi.fn() },
+    } as unknown as ExtensionContext;
+
+    registerFabricCommand(omp, {
+      state,
+      fabricUi: {} as FabricUiController,
+      capturedTools: {} as CapturedToolCatalog,
+      applyFabricMode: vi.fn(),
+      suspendToolCapture: vi.fn(),
+      autoArmPrewalk: vi.fn(async () => {}),
+    });
+    await handler!("prewalk", context);
+
+    expect(arm).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "@missing, @worker, anthropic/literal", mode: "trajectory" }),
+    );
+  });
+
+  it.each(["plain-model"])(
+    "rejects a configured selector with no provider/model or @role part: %j",
+    async (model) => {
+      let handler: ((argumentsText: string, context: ExtensionContext) => Promise<void>) | undefined;
+      const omp = {
+        sendUserMessage: vi.fn(),
+        registerCommand: vi.fn((_name: string, definition: { handler: typeof handler }) => {
+          handler = definition.handler;
+        }),
+      } as unknown as ExtensionAPI;
+      const arm = vi.fn();
+      const notify = vi.fn();
+      const select = vi.fn();
+      const state = {
+        ensure: vi.fn().mockResolvedValue(undefined),
+        config: {
+          fullCodeMode: true,
+          schema: { mode: "off" },
+          prewalk: { mode: "in-place", model },
+          agents: { enabled: true },
+        },
+        prewalk: { arm, status: vi.fn(), cancel: vi.fn() },
+      } as unknown as FabricState;
+      const context = {
+        modelRegistry: { getAvailable: () => [{ provider: "openai", id: "executor" }] },
+        sessionManager: { getSessionId: () => "session-1" },
+        ui: { notify, select },
+      } as unknown as ExtensionContext;
+
+      registerFabricCommand(omp, {
+        state,
+        fabricUi: {} as FabricUiController,
+        capturedTools: {} as CapturedToolCatalog,
+        applyFabricMode: vi.fn(),
+        suspendToolCapture: vi.fn(),
+        autoArmPrewalk: vi.fn(async () => {}),
+      });
+      await handler!("prewalk", context);
+
+      expect(arm).not.toHaveBeenCalled();
+      expect(select).not.toHaveBeenCalled();
+      expect(notify).toHaveBeenCalledWith(
+        "prewalk.model must use provider/model form or an @role selector.",
+        "error",
+      );
+    },
+  );
+
 });

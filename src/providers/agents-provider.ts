@@ -1,4 +1,7 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { SettingsManager } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
+import { resolveOmpRole } from "../core/omp-model-role.js";
+import { isOmpRoleSelector } from "../core/model-resolution.js";
 import { ActorManager, ActorRegistryOwnershipError } from "../actors/manager.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent } from "../actors/types.js";
@@ -105,13 +108,13 @@ const resolveThinkingTransfer = (
   targetKey: string,
   sourceModel?: { provider: string; modelId: string },
 ): ThinkingTransferInput | undefined => {
-  const separator = targetKey.indexOf("/");
-  if (separator <= 0 || separator === targetKey.length - 1) return undefined;
-  // Invocation contexts don't always thread the extension host (tests, nested
-  // runners); without a registry no family comparison is possible.
+  // Invocation contexts do not always thread the extension host.
   const registry = extensionContext?.modelRegistry;
   if (!registry) return undefined;
-  const target = registry.find(targetKey.slice(0, separator), targetKey.slice(separator + 1));
+  const targetModelKey = targetKey;
+  const separator = targetModelKey.indexOf("/");
+  if (separator <= 0 || separator === targetModelKey.length - 1) return undefined;
+  const target = registry.find(targetModelKey.slice(0, separator), targetModelKey.slice(separator + 1));
   if (!target) return undefined;
   const source = sourceModel
     ? {
@@ -154,10 +157,34 @@ const stringArray = (value: unknown): string[] | undefined =>
     ? value.filter((entry): entry is string => typeof entry === "string")
     : undefined;
 
-const actorRunBinding = (args: Record<string, unknown>): FabricActorRunBinding => ({
+const ACTOR_TARGET_ACTIONS: ReadonlySet<string> = new Set(["ask", "tell", "setModel"]);
+
+const normalizeRoleCandidates = (args: Record<string, unknown>, defaultRunner: FabricAgentRunner, action: string): Record<string, unknown> => {
+  if (!Array.isArray(args.model)) return args;
+  if (args.model.length === 0 || !args.model.every((item: unknown) => typeof item === "string" && item.trim()) || !args.model.some((item: string) => isOmpRoleSelector(item))) {
+    throw new Error("OMP model candidate arrays must contain non-empty selectors and at least one @role");
+  }
+  // ask/tell/setModel take no runner: the effective runner belongs to the
+  // addressed actor, which prepareArguments cannot see. Defer validation to
+  // invoke, where the target is resolved, so a Claude-default host can still
+  // send @role candidates to an OMP actor instead of rejecting them here.
+  if (ACTOR_TARGET_ACTIONS.has(action)) return args;
+  const runner = args.runner ?? (action === "handoff" || action === "switchModel" ? "omp" : defaultRunner);
+  if (runner !== "omp") throw new Error("Model candidate arrays require the OMP runner");
+  return { ...args, model: args.model.join(",") };
+};
+
+// Carrier for invoke-time model arguments: string selectors pass through
+// verbatim while candidate arrays stay arrays so the runner check at the
+// resolved actor target can accept (OMP) or reject (non-OMP) them.
+const actorRunBinding = (
+  args: Record<string, unknown>,
+): Omit<FabricActorRunBinding, "model"> & { model?: unknown } => ({
   ...(typeof args.model === "string" && args.model.trim()
     ? { model: args.model.trim() }
-    : {}),
+    : Array.isArray(args.model)
+      ? { model: args.model }
+      : {}),
   ...(isFabricThinking(args.thinking) ? { thinking: args.thinking } : {}),
 });
 
@@ -226,6 +253,7 @@ const runRequest = (
       ? { persona: args.persona.trim() }
       : {}),
     ...(thinking ? { thinking } : {}),
+    ...(args.nativeThinking === "auto" || args.nativeThinking === "inherit" ? { nativeThinking: args.nativeThinking } : {}),
     ...(tools ? { tools } : {}),
     ...(addTools ? { addTools } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
@@ -363,6 +391,7 @@ const actorRequest = (
         ? { model: inheritedModel }
         : {}),
     ...(isFabricThinking(args.thinking) ? { thinking: args.thinking } : {}),
+    ...(args.nativeThinking === "auto" || args.nativeThinking === "inherit" ? { nativeThinking: args.nativeThinking } : {}),
     ...(tools ? { tools } : {}),
     ...(args.transport === "auto" ||
     args.transport === "process" ||
@@ -726,8 +755,13 @@ export class AgentsProvider implements FabricProvider {
         ? args.runner
         : this.manager.config.runner);
     if (runner !== "omp") return args;
-    const model = typeof args.model === "string" ? args.model.trim() : "";
+    const configured = this.manager.config.model?.trim() ?? "";
+    const model = typeof args.model === "string" ? args.model.trim() : isOmpRoleSelector(configured) ? configured : "";
     if (!model) return args;
+    if (isOmpRoleSelector(model)) {
+      const resolved = resolveOmpRole(model, context.extensionContext, SettingsManager.create(context.extensionContext.cwd), isFabricThinking(args.thinking));
+      return { ...args, model: resolved.model, ...(resolved.nativeThinking ? { nativeThinking: resolved.nativeThinking } : {}), ...(args.thinking === undefined && resolved.thinking ? { thinking: resolved.thinking } : {}) };
+    }
     const resolved = this.#resolveOmpModel(model, context);
     return resolved === model ? args : { ...args, model: resolved };
   }
@@ -738,7 +772,41 @@ export class AgentsProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): FabricActorRunBinding {
     if (runner !== "omp" || !binding.model) return binding;
+    if (isOmpRoleSelector(binding.model)) {
+      const resolved = resolveOmpRole(binding.model, context.extensionContext, SettingsManager.create(context.extensionContext.cwd), binding.thinking !== undefined);
+      return { model: resolved.model, ...(resolved.nativeThinking ? { nativeThinking: resolved.nativeThinking } : {}), ...(binding.thinking ?? resolved.thinking ? { thinking: binding.thinking ?? resolved.thinking } : {}) };
+    }
     return { ...binding, model: this.#resolveOmpModel(binding.model, context) };
+  }
+
+  // Invoke-time companion to normalizeRoleCandidates for the actor-target
+  // actions, which defer their check until the addressed actor's runner is
+  // known. A known non-OMP target rejects candidate arrays outright; the OMP
+  // branch collapses the joinable array the same way the prepare path does.
+  #normalizeActorRoleCandidates<T extends { model?: unknown }>(
+    args: T,
+    runner: FabricAgentRunner,
+  ): T {
+    if (!Array.isArray(args.model)) return args;
+    if (runner !== "omp") {
+      throw new Error("Model candidate arrays require the OMP runner");
+    }
+    return { ...args, model: args.model.join(",") };
+  }
+
+  // Same check for the run-binding carrier: an array held in binding.model is
+  // validated against the resolved actor's runner and collapsed to its join
+  // string for OMP targets.
+  #normalizeActorBindingCandidates(
+    binding: Omit<FabricActorRunBinding, "model"> & { model?: unknown },
+    runner: FabricAgentRunner,
+  ): FabricActorRunBinding {
+    // The carrier only ever holds a string selector or a candidate array.
+    if (!Array.isArray(binding.model)) return binding as FabricActorRunBinding;
+    if (runner !== "omp") {
+      throw new Error("Model candidate arrays require the OMP runner");
+    }
+    return { ...binding, model: binding.model.join(",") };
   }
 
   async list(
@@ -764,7 +832,7 @@ export class AgentsProvider implements FabricProvider {
     actionName: string,
     args: Record<string, unknown>,
   ): Record<string, unknown> {
-    return normalizeAgentsArgs(actionName, args);
+    return normalizeRoleCandidates(normalizeAgentsArgs(actionName, args), this.manager.config.runner, actionName);
   }
 
   async handoff(
@@ -850,6 +918,7 @@ export class AgentsProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<unknown> {
+    args = normalizeRoleCandidates(args, this.manager.config.runner, actionName);
     switch (actionName) {
       case "run": {
         const handle = await this.manager.spawn(
@@ -1039,6 +1108,19 @@ export class AgentsProvider implements FabricProvider {
             "agents.switchModel requires a model selector: provider/id, models.aliases name, or search term",
           );
         }
+        if (isOmpRoleSelector(query)) {
+          const selection = resolveOmpRole(query, context.extensionContext, SettingsManager.create(context.extensionContext.cwd));
+          if (selection.nativeThinking === "auto") throw new Error("agents.switchModel cannot apply native auto thinking: the host model API does not expose per-turn auto classification");
+          const separator = selection.model.indexOf("/");
+          if (typeof args.provider === "string" && args.provider.trim() && selection.model.slice(0, separator).toLowerCase() !== args.provider.trim().toLowerCase()) {
+            throw new Error("agents.switchModel: role resolves outside the requested provider");
+          }
+          if (typeof this.mainAgent.switchModel !== "function") throw new Error("agents.switchModel requires a local Main session");
+          const outcome = await this.mainAgent.switchModel({ provider: selection.model.slice(0, separator), id: selection.model.slice(separator + 1), ...(selection.nativeThinking === "inherit" ? { thinking: "inherit" as const } : selection.thinking ? { thinking: selection.thinking } : {}) }, context.extensionContext);
+          if (!outcome.ok) throw new Error(`agents.switchModel: ${outcome.error ?? "switch failed"}`);
+          this.residency?.syncOmpModels();
+          return { switched: true, model: selection.model, ...(selection.nativeThinking === "inherit" ? { thinking: "inherit" as const } : selection.thinking ? { thinking: selection.thinking } : {}) };
+        }
         const registry = context.extensionContext.modelRegistry;
         let available: FabricModelCandidate[] = [];
         try {
@@ -1148,9 +1230,15 @@ export class AgentsProvider implements FabricProvider {
         this.actorManager.validateDirectMessage(message, args.data);
         const { actor, participant } = this.#resolveActorTarget(id);
         const ownsActor = actor ? this.actorManager.owns(actor.id) : false;
-        const requestedOverrides = actorRunBinding(args);
-        const overrides = ownsActor
-          ? this.#resolveOmpRunBinding(requestedOverrides, actor!.runner, context)
+        const runner = actor?.runner ?? participant!.runner;
+        // The array check runs on raw args so a joined candidate chain keeps
+        // its string form for actorRunBinding below.
+        const normalizedArgs = this.#normalizeActorRoleCandidates(args, runner);
+        const requestedOverrides = actorRunBinding(normalizedArgs) as FabricActorRunBinding;
+        const callerRole = runner === "omp" && typeof requestedOverrides.model === "string" &&
+          isOmpRoleSelector(requestedOverrides.model);
+        const overrides = ownsActor || callerRole
+          ? this.#resolveOmpRunBinding(requestedOverrides, runner, context)
           : requestedOverrides;
         context.activity?.({
           type: "entity",
@@ -1252,17 +1340,21 @@ export class AgentsProvider implements FabricProvider {
       }
       case "setModel": {
         const id = String(args.id);
-        const model = typeof args.model === "string" ? args.model.trim() : "";
         const target = this.#resolveActorTarget(id);
         const ownsActor = target.actor ? this.actorManager.owns(target.actor.id) : false;
         const runner = target.actor?.runner ?? target.participant!.runner;
-        const resolvedModel = model && ownsActor
-          ? this.#resolveOmpModelArgs({ model }, context, runner).model as string
-          : model || undefined;
+        const modelValue = this.#normalizeActorRoleCandidates(args, runner).model;
+        const model = typeof modelValue === "string" ? modelValue.trim() : "";
+        const resolved = model && (ownsActor || (runner === "omp" && isOmpRoleSelector(model)))
+          ? this.#resolveOmpModelArgs({ model }, context, runner)
+          : { model: model || undefined };
         return this.actorManager.setModel(
           id,
-          resolvedModel,
+          typeof resolved.model === "string" ? resolved.model : undefined,
           args.scope === "project" ? "project" : "session",
+          "thinking" in resolved && isFabricThinking(resolved.thinking) ? resolved.thinking : undefined,
+          runner === "omp" && isOmpRoleSelector(model),
+          resolved.nativeThinking === "auto" || resolved.nativeThinking === "inherit" ? resolved.nativeThinking : undefined,
         );
       }
       case "setThinking":
@@ -1334,12 +1426,12 @@ export class AgentsProvider implements FabricProvider {
         const resolvedRequest = request.model
           ? {
               ...request,
-              model: this.#resolveOmpModelArgs(
-                { model: request.model },
+              ...this.#resolveOmpModelArgs(
+                { model: request.model, ...(request.thinking ? { thinking: request.thinking } : {}) },
                 context,
                 request.runner ?? this.manager.config.runner,
-              ).model as string,
-            }
+              ),
+            } as FabricActorRequest
           : request;
         const actor = await this.#createActor(resolvedRequest);
         this.participants.scheduleRefresh();
@@ -1392,7 +1484,7 @@ export class AgentsProvider implements FabricProvider {
     options: {
       from?: MeshIdentity;
       triggerTurn?: boolean;
-      binding?: FabricActorRunBinding;
+      binding?: Omit<FabricActorRunBinding, "model"> & { model?: unknown };
     } = {},
   ): Promise<FabricAgentMessageResult> {
     if (this.mainAgent.matches(id)) {
@@ -1463,9 +1555,15 @@ export class AgentsProvider implements FabricProvider {
     }
     const { actor, participant } = target;
     const localActor = Boolean(actor && (!participant || participant.local));
-    const binding = options.binding && context && localActor
-      ? this.#resolveOmpRunBinding(options.binding, actor!.runner, context)
-      : options.binding;
+    const runner = actor?.runner ?? participant!.runner;
+    const normalizedBinding = options.binding
+      ? this.#normalizeActorBindingCandidates(options.binding, runner)
+      : undefined;
+    const callerRole = runner === "omp" && typeof normalizedBinding?.model === "string" &&
+      isOmpRoleSelector(normalizedBinding.model);
+    const binding = normalizedBinding && context && (localActor || callerRole)
+      ? this.#resolveOmpRunBinding(normalizedBinding, runner, context)
+      : normalizedBinding;
     if (actor && localActor) {
       context?.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
       const result = this.actorManager.tell(actor.id, message, data, {

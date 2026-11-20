@@ -1469,6 +1469,29 @@ describe("ActorManager", () => {
     expect(actors.status(actor.id).thinking).toBeUndefined();
   });
 
+  it.each(["auto", "inherit"] as const)("keeps native %s when a model alone is overridden", async (mode) => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "reviewer", instructions: "Review messages.", responseMode: "text", model: "provider/project", nativeThinking: mode });
+    expect(actors.resolveBinding(actor.id, { model: "provider/call" })).toEqual({ model: "provider/call", nativeThinking: mode });
+    await actors.setModel(actor.id, "provider/session");
+    expect(actors.resolveBinding(actor.id)).toEqual({ model: "provider/session", nativeThinking: mode });
+    await actors.setModel(actor.id, "provider/session", "session", undefined, true, mode);
+    expect(actors.resolveBinding(actor.id, { model: "provider/call" })).toEqual({ model: "provider/call", nativeThinking: mode });
+    await actors.setThinking(actor.id, "high", "session");
+    expect(actors.resolveBinding(actor.id, { model: "provider/call" })).toEqual({ model: "provider/call", thinking: "high" });
+  });
+
+  it.each(["auto", "inherit"] as const)("keeps native %s ahead of project thinking and accepts a call override", async (mode) => {
+    const { actors } = setup();
+    const actor = await actors.create({ name: "reviewer", instructions: "Review messages.", responseMode: "text" });
+    await actors.setThinking(actor.id, "high", "project");
+    await actors.setModel(actor.id, "provider/model", "session", undefined, true, mode);
+    expect(actors.status(actor.id).model).toBe("provider/model");
+    expect(actors.status(actor.id).thinking).toBeUndefined();
+    await actors.setThinking(actor.id, "medium", "session");
+    expect(actors.status(actor.id).thinking).toBe("medium");
+  });
+
   it("setThinking rejects an invalid thinking level", async () => {
     const { actors } = setup();
     const actor = await actors.create({

@@ -6,6 +6,7 @@ import { isFabricThinking, type FabricThinking } from "../thinking.js";
 
 export interface ActorSessionBindingRecord {
   model?: string;
+  nativeThinking?: "auto" | "inherit";
   thinking?: FabricThinking;
   updatedAt: number;
 }
@@ -55,11 +56,18 @@ export class ActorBindingStore {
   async setModel(
     actorId: string,
     model: string | undefined,
+    thinking?: FabricThinking,
+    replaceThinking = false,
+    nativeThinking?: "auto" | "inherit",
   ): Promise<ActorSessionBindingRecord | undefined> {
     const next = model?.trim();
     return this.#update(actorId, (binding) => {
       if (next) binding.model = next;
       else delete binding.model;
+      if (nativeThinking) binding.nativeThinking = nativeThinking;
+      else if (replaceThinking || thinking !== undefined) delete binding.nativeThinking;
+      if (thinking !== undefined) binding.thinking = thinking;
+      else if (replaceThinking) delete binding.thinking;
     });
   }
 
@@ -70,6 +78,7 @@ export class ActorBindingStore {
     return this.#update(actorId, (binding) => {
       if (thinking) binding.thinking = thinking;
       else delete binding.thinking;
+      delete binding.nativeThinking;
     });
   }
 
@@ -134,9 +143,11 @@ export class ActorBindingStore {
       if (!isObject(value) || typeof value.updatedAt !== "number") continue;
       const model = typeof value.model === "string" ? value.model.trim() : "";
       const thinking = isFabricThinking(value.thinking) ? value.thinking : undefined;
+      const nativeThinking = value.nativeThinking === "auto" || value.nativeThinking === "inherit" ? value.nativeThinking : undefined;
       if (!model && !thinking) continue;
       bindings.set(actorId, {
         ...(model ? { model } : {}),
+        ...(nativeThinking ? { nativeThinking } : {}),
         ...(thinking ? { thinking } : {}),
         updatedAt: value.updatedAt,
       });

@@ -1,8 +1,11 @@
 import type { AssistantMessage, Context, Model, SimpleStreamOptions, Tool, Usage } from "@oh-my-pi/pi-ai";
 import { Type } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-typebox";
+import { SettingsManager } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { FabricRisk } from "../protocol.js";
 import type { ResolvedFabricAction } from "./action-registry.js";
+import { isOmpRoleSelector } from "./model-resolution.js";
+import { resolveOmpRole } from "./omp-model-role.js";
 
 const MAX_TRANSCRIPT_CHARS = 24_000;
 const MAX_ARGUMENT_CHARS = 16_000;
@@ -122,6 +125,20 @@ const completeWithOmpProvider = async (
 
 const configuredModel = (context: ExtensionContext, modelKey?: string) => {
   if (!modelKey) return context.model;
+  if (isOmpRoleSelector(modelKey)) {
+    const resolved = resolveOmpRole(
+      modelKey,
+      context,
+      SettingsManager.create(context.cwd),
+      true,
+    );
+    const separator = resolved.model.indexOf("/");
+    if (separator <= 0 || separator === resolved.model.length - 1) return undefined;
+    return context.modelRegistry.find(
+      resolved.model.slice(0, separator),
+      resolved.model.slice(separator + 1),
+    );
+  }
   const separator = modelKey.indexOf("/");
   if (separator <= 0 || separator === modelKey.length - 1) return undefined;
   return context.modelRegistry.find(
